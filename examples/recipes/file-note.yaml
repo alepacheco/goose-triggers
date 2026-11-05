@@ -1,0 +1,19 @@
+version: "1.0.0"
+title: Note a new file
+description: Writes a one-line note about a file that arrived in a watched folder.
+parameters:
+  - key: file_path
+    input_type: string
+    requirement: required
+    description: Full path of the new file
+  - key: file_name
+    input_type: string
+    requirement: required
+    description: Name of the new file
+prompt: |
+  A new file arrived: {{ file_name }} (at {{ file_path }}).
+  Look at what kind of file it is, then append one line about it to notes.md in the
+  working folder: the date, the file's name and what it seems to be.
+extensions:
+  - type: builtin
+    name: developer

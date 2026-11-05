@@ -1,0 +1,39 @@
+# goose-triggers example config. Copy it to ~/.config/goose-triggers/config.yaml and
+# change the folders and recipes. Relative paths are relative to this file.
+
+# Where goose-triggers keeps its store and run logs (default: ~/.local/share/goose-triggers).
+# state_dir: ~/.local/share/goose-triggers
+
+# The goose binary (default: goose on PATH).
+# goose: goose
+
+# How many goose runs may go at once (default: 2).
+# max_concurrent_runs: 2
+
+# The local webhook listener, needed by rules with `webhook: true`. Callers send the shared
+# secret as `Authorization: Bearer <secret>`. Keep the secret in an environment variable.
+webhook:
+  listen: 127.0.0.1:8787
+  secret_env: GOOSE_TRIGGERS_WEBHOOK_SECRET
+
+rules:
+  # A new PDF in ~/Inbox starts recipes/file-note.yaml with the file's name and path.
+  # goose may read and list freely; writing a file or running a command waits for approval.
+  - name: inbox-notes
+    folder: ~/Inbox
+    pattern: "*.pdf"
+    recipe: recipes/file-note.yaml
+    hold: [shell, write, edit]
+
+  # POST http://127.0.0.1:8787/hooks/form-entry starts recipes/form-entry.yaml with the
+  # JSON body's top-level fields as parameters.
+  - name: form-entry
+    webhook: true
+    recipe: recipes/form-entry.yaml
+    hold: [shell, write, edit]
+    # Optional: the folder goose works in (default: <state_dir>/work/<rule name>),
+    # and the provider, model and turn limit for this rule's runs.
+    # working_dir: ~/forms
+    # provider: ollama
+    # model: qwen3:8b
+    # max_turns: 30

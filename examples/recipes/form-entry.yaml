@@ -1,0 +1,20 @@
+version: "1.0.0"
+title: Record a form entry
+description: Appends a form entry sent by webhook to entries.csv.
+parameters:
+  - key: name
+    input_type: string
+    requirement: required
+    description: The name field of the form
+  - key: email
+    input_type: string
+    requirement: optional
+    default: ""
+    description: The email field of the form
+prompt: |
+  A form entry came in: name "{{ name }}", email "{{ email }}".
+  Append it as one line to entries.csv in the working folder (create the file with a
+  header line name,email if it does not exist).
+extensions:
+  - type: builtin
+    name: developer
