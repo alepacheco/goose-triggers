@@ -73,6 +73,21 @@ fn write_if_changed(path: &Path, text: &str) -> Result<()> {
     std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
 }
 
+/// The other plugins in a working folder (goose loads every folder there).
+pub fn other_plugins(working_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(working_dir.join(".agents").join("plugins")) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != PLUGIN_NAME)
+        .collect();
+    names.sort();
+    names
+}
+
 /// goose's config folder: `$GOOSE_PATH_ROOT/config` when that is set, else
 /// `$XDG_CONFIG_HOME/goose` or `~/.config/goose`.
 pub fn goose_config_dir() -> PathBuf {
@@ -165,6 +180,9 @@ mod tests {
         assert!(root.join("plugin.json").is_file());
         assert!(root.join("hooks/hooks.json").is_file());
         preflight(&dir).unwrap();
+        assert!(other_plugins(&dir).is_empty());
+        std::fs::create_dir_all(dir.join(".agents/plugins/other/hooks")).unwrap();
+        assert_eq!(other_plugins(&dir), ["other"]);
         std::fs::create_dir_all(dir.join(".config/goose")).unwrap();
         std::fs::write(
             dir.join(".config/goose/settings.json"),

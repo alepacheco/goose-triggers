@@ -43,6 +43,19 @@ pub fn resolve_path(raw: &str, base: &Path) -> PathBuf {
     }
 }
 
+/// Creates a folder (and its missing parents) readable by this user only; one that exists is
+/// left as it is.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    if dir.is_dir() {
+        return Ok(());
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
 /// Seconds since the Unix epoch.
 pub fn now() -> i64 {
     SystemTime::now()
@@ -85,15 +98,49 @@ pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// Shortens a text to `max` characters for one-line displays.
+/// A text safe to print on a terminal: control characters (escape sequences included) shown
+/// as `\u{..}` escapes, newlines and tabs as `\n` and `\t`.
+pub fn clean(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&c.escape_unicode().to_string()),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Shortens a text to `max` characters for one-line displays, cleaned for the terminal.
 pub fn short(s: &str, max: usize) -> String {
-    let one_line: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let one_line = clean(s);
     if one_line.chars().count() <= max {
         one_line
     } else {
         let cut: String = one_line.chars().take(max.saturating_sub(1)).collect();
         format!("{cut}…")
     }
+}
+
+/// A tool call's input (canonical JSON text) for a one-line display: an object's fields
+/// shortest value first, so short fields such as a file path are not cut off behind a long
+/// one. `goose-triggers log <run>` shows the whole call.
+pub fn call_line(input: &str, max: usize) -> String {
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(input) else {
+        return short(input, max);
+    };
+    let mut fields: Vec<(String, String)> = map
+        .into_iter()
+        .map(|(k, v)| (serde_json::to_string(&k).unwrap_or_default(), v.to_string()))
+        .collect();
+    fields.sort_by_key(|(_, v)| v.len());
+    let body: Vec<String> = fields
+        .into_iter()
+        .map(|(k, v)| format!("{k}:{v}"))
+        .collect();
+    short(&format!("{{{}}}", body.join(",")), max)
 }
 
 /// goose providers that hand the whole turn to another agent CLI, which runs its own tools:
@@ -136,6 +183,22 @@ mod tests {
         assert!(!same_secret(b"abc", b"abd"));
         assert!(!same_secret(b"abc", b"abcd"));
         assert!(!same_secret(b"", b"a"));
+    }
+
+    #[test]
+    fn clean_escapes_control_characters() {
+        assert_eq!(clean("a\u{1b}[2Jb\nc\td"), "a\\u{1b}[2Jb\\nc\\td");
+        assert_eq!(short("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn call_line_shows_short_fields_first() {
+        let input = canonical_json(&json!({"content": "x".repeat(300), "path": "/etc/passwd"}));
+        let line = call_line(&input, 60);
+        assert!(
+            line.starts_with(r#"{"path":"/etc/passwd","content":"xxx"#),
+            "{line}"
+        );
     }
 
     #[test]

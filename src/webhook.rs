@@ -15,7 +15,8 @@ use crate::config::{Config, Source};
 use crate::store::Store;
 use crate::util::same_secret;
 
-pub const MAX_BODY: usize = 1 << 20;
+/// Bodies are capped at 64 KiB, so that each field passed to goose fits in one argument.
+pub const MAX_BODY: usize = 64 << 10;
 
 /// Stores an event for a rule and queues its run: (event id, run id).
 pub type Queue<'a> =
@@ -92,7 +93,7 @@ pub fn handle(
         return reply(400, json!({"error": "could not read the body"}));
     }
     if buf.len() > MAX_BODY {
-        return reply(413, json!({"error": "body over 1 MiB"}));
+        return reply(413, json!({"error": "body over 64 KiB"}));
     }
     let Ok(text) = String::from_utf8(buf) else {
         return reply(400, json!({"error": "the body is not UTF-8 text"}));

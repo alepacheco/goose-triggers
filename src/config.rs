@@ -57,6 +57,8 @@ pub struct Config {
 pub struct Webhook {
     pub listen: String,
     pub secret: String,
+    /// The environment variable the secret came from: kept out of goose's environment.
+    pub secret_env: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,8 +172,10 @@ impl Config {
             Some(w) if !strict => Some(Webhook {
                 listen: w.listen.unwrap_or_else(|| "127.0.0.1:8787".into()),
                 secret: String::new(),
+                secret_env: w.secret_env,
             }),
             Some(w) => {
+                let secret_env = w.secret_env.clone();
                 let secret = match (w.secret, w.secret_env) {
                     (Some(_), Some(_)) => bail!("webhook: give `secret` or `secret_env`, not both"),
                     (Some(s), None) => s,
@@ -188,6 +192,7 @@ impl Config {
                 Some(Webhook {
                     listen: w.listen.unwrap_or_else(|| "127.0.0.1:8787".into()),
                     secret,
+                    secret_env,
                 })
             }
         };

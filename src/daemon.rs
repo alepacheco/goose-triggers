@@ -32,7 +32,7 @@ pub fn say(what: &str) {
 
 /// Holds the state folder's lock while `goose-triggers run` runs: one daemon per state folder.
 pub fn lock(state_dir: &Path) -> Result<File> {
-    std::fs::create_dir_all(state_dir)
+    crate::util::create_private_dir(state_dir)
         .with_context(|| format!("creating {}", state_dir.display()))?;
     let path = state_dir.join("daemon.lock");
     let f = OpenOptions::new()
@@ -66,6 +66,24 @@ pub fn is_running(state_dir: &Path) -> bool {
 
 /// Stores an event and queues its run (a failed run, saying why, when the event lacks a
 /// parameter the recipe needs). `None` when the event was stored before.
+/// Tools that reach other tools or start new ones out of the hook's sight: code mode runs
+/// tool calls inside JavaScript, and the extension manager turns on extensions mid-run. A
+/// rule that holds anything holds these too.
+pub const IMPLICIT_HOLDS: &[&str] = &["*execute_javascript", "*manage_extensions"];
+
+/// A run's hold patterns: the rule's, and the implicit ones when it has any.
+pub fn run_holds(rule_holds: &[String]) -> Vec<String> {
+    let mut holds = rule_holds.to_vec();
+    if !holds.is_empty() {
+        for h in IMPLICIT_HOLDS {
+            if !holds.iter().any(|x| x == h) {
+                holds.push(h.to_string());
+            }
+        }
+    }
+    holds
+}
+
 pub fn queue_event(
     store: &Store,
     rule: &Rule,
@@ -83,13 +101,16 @@ pub fn queue_event(
         Err(e) => (Vec::new(), Some(format!("{e:#}"))),
     };
     let recipe = rule.recipe.to_string_lossy();
-    let wd = rule.working_dir.to_string_lossy();
+    // The real path: goose keys its plugin settings by the folder it runs in.
+    let wd = std::fs::canonicalize(&rule.working_dir).unwrap_or_else(|_| rule.working_dir.clone());
+    let wd = wd.to_string_lossy();
+    let holds = run_holds(&rule.hold);
     let run = store.add_run(&NewRun {
         rule: &rule.name,
         event_id: event,
         recipe: &recipe,
         params: &params,
-        holds: &rule.hold,
+        holds: &holds,
         working_dir: &wd,
         provider: rule.provider.as_deref(),
         model: rule.model.as_deref(),
@@ -99,7 +120,7 @@ pub fn queue_event(
     let shown: Vec<String> = fields
         .iter()
         .filter(|(k, _)| k.as_str() != "body" || fields.len() == 1)
-        .map(|(k, v)| format!("{k}={}", short(v, 60)))
+        .map(|(k, v)| format!("{}={}", crate::util::clean(k), short(v, 60)))
         .collect();
     let what = format!("{source} event {event}: {}", shown.join(" "));
     store.log(Some(run), &what)?;
@@ -137,11 +158,26 @@ fn check_rule(rule: &Rule, exe: &Path) -> Result<()> {
                 rule.name
             );
         }
-        if !matches_hold(&rule.hold, "shell") {
+        let unheld: Vec<&str> = ["shell", "write", "edit"]
+            .into_iter()
+            .filter(|t| !matches_hold(&rule.hold, t))
+            .collect();
+        if !unheld.is_empty() {
             say(&format!(
-                "warning: rule {} holds {:?} but not shell: a run could do through shell what a held tool does",
-                rule.name, rule.hold
+                "warning: rule {} holds {:?} but not {}: a run can run commands or write files through those, so it could do what a held tool does",
+                rule.name,
+                rule.hold,
+                unheld.join(", ")
             ));
+        }
+        let others = crate::plugin::other_plugins(&rule.working_dir);
+        if !others.is_empty() {
+            bail!(
+                "rule {}: {} holds other goose plugins ({}), whose hooks could run commands no hold sees: remove them, or give the rule a working folder of its own",
+                rule.name,
+                rule.working_dir.join(".agents/plugins").display(),
+                others.join(", ")
+            );
         }
     }
     Ok(())
@@ -189,7 +225,7 @@ pub fn run(cfg: Config) -> Result<()> {
         bail!("the config has no rules");
     }
     let _lock = lock(&cfg.state_dir)?;
-    std::fs::create_dir_all(cfg.runs_dir())?;
+    crate::util::create_private_dir(&cfg.runs_dir())?;
     let store = Store::open(&cfg.db_path())?;
     let exe = std::env::current_exe()
         .and_then(std::fs::canonicalize)
@@ -204,6 +240,14 @@ pub fn run(cfg: Config) -> Result<()> {
     }
 
     for r in store.runs_in(state::RUNNING)? {
+        if store.has_open_permission(r.id)? {
+            // A resumed run that had not made its approved call yet: resume it again.
+            store.transition(r.id, &[state::RUNNING], state::APPROVED, None)?;
+            let what = "goose-triggers stopped before the approved call was made; the run resumes";
+            store.log(Some(r.id), what)?;
+            say(&format!("run {} ({}): {what}", r.id, r.rule));
+            continue;
+        }
         let msg = "goose-triggers stopped while this run was going";
         store.transition(r.id, &[state::RUNNING], state::FAILED, Some(msg))?;
         store.log(Some(r.id), &format!("failed: {msg}"))?;
@@ -300,4 +344,21 @@ pub fn run(cfg: Config) -> Result<()> {
     }
     say("stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rules_with_holds_also_hold_code_mode_and_the_extension_manager() {
+        assert!(run_holds(&[]).is_empty());
+        let h = run_holds(&["shell".to_string()]);
+        assert!(matches_hold(&h, "shell"));
+        assert!(matches_hold(&h, "execute_javascript"));
+        assert!(matches_hold(&h, "code_execution__execute_javascript"));
+        assert!(matches_hold(&h, "manage_extensions"));
+        assert!(matches_hold(&h, "extensionmanager__manage_extensions"));
+        assert!(!matches_hold(&h, "tree"));
+    }
 }

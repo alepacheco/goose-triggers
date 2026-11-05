@@ -7,7 +7,24 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::store::{state, Store};
-use crate::util::{fmt_time, short};
+use crate::util::{call_line, clean, fmt_time, short};
+
+/// A tool call's input in full, for the user to read before deciding: pretty JSON (which
+/// escapes control characters in its strings), any other control character escaped.
+fn full_call(input: &str) -> String {
+    let text = serde_json::from_str::<Value>(input)
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| input.to_string());
+    text.split('\n').map(clean).collect::<Vec<_>>().join("\n")
+}
+
+fn indent(text: &str, by: &str) -> String {
+    text.lines()
+        .map(|l| format!("{by}{l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 fn open(cfg: &Config) -> Result<Store> {
     let db = cfg.db_path();
@@ -34,7 +51,7 @@ pub fn status(cfg: &Config, all: bool) -> Result<()> {
     for r in &runs {
         let detail = match r.state.as_str() {
             state::HELD => match store.pending_call(r.id)? {
-                Some(c) => format!("waits on: {} {}", c.tool_name, short(&c.tool_input, 80)),
+                Some(c) => format!("waits on: {} {}", c.tool_name, call_line(&c.tool_input, 80)),
                 None => "held".into(),
             },
             state::FAILED => r
@@ -58,7 +75,7 @@ pub fn status(cfg: &Config, all: bool) -> Result<()> {
     let held = runs.iter().filter(|r| r.state == state::HELD).count();
     if held > 0 {
         println!(
-            "\n{held} run(s) held: goose-triggers approve <RUN> | goose-triggers reject <RUN>"
+            "\n{held} run(s) held. Read a held call in full with goose-triggers log <RUN>, then: goose-triggers approve <RUN> | goose-triggers reject <RUN>"
         );
     }
     if !crate::daemon::is_running(&cfg.state_dir) {
@@ -141,7 +158,7 @@ pub fn log(cfg: &Config, run: Option<i64>) -> Result<()> {
     let Some(id) = run else {
         for l in store.recent_timeline(40)? {
             let who = l.run_id.map(|r| format!("run {r}")).unwrap_or_default();
-            println!("{}  {who:<8} {}", fmt_time(l.at), l.what);
+            println!("{}  {who:<8} {}", fmt_time(l.at), clean(&l.what));
         }
         return Ok(());
     };
@@ -167,7 +184,7 @@ pub fn log(cfg: &Config, run: Option<i64>) -> Result<()> {
             fmt_time(ev.received_at)
         );
         for (k, v) in &ev.fields {
-            println!("  {k} = {}", short(v, 200));
+            println!("  {} = {}", clean(k), short(v, 200));
         }
     }
     println!("goose session: {}", r.session_id.as_deref().unwrap_or("-"));
@@ -177,17 +194,17 @@ pub fn log(cfg: &Config, run: Option<i64>) -> Result<()> {
         println!("\nheld calls:");
         for c in calls {
             println!(
-                "  {}  {:<8} {} {}",
+                "  {}  {}  {}",
                 fmt_time(c.created_at),
                 c.state,
-                c.tool_name,
-                short(&c.tool_input, 160)
+                clean(&c.tool_name)
             );
+            println!("{}", indent(&full_call(&c.tool_input), "      "));
         }
     }
     println!("\ntimeline:");
     for l in store.timeline(id)? {
-        println!("  {}  {}", fmt_time(l.at), l.what);
+        println!("  {}  {}", fmt_time(l.at), clean(&l.what));
     }
     let out = cfg.runs_dir().join(format!("{id}.jsonl"));
     if let Ok(f) = std::fs::File::open(&out) {
@@ -218,11 +235,8 @@ pub fn approve(cfg: &Config, run: i64) -> Result<()> {
     refuse_inside_a_run()?;
     let store = open(cfg)?;
     let call = store.approve(run)?;
-    println!(
-        "run {run}: approved {} {}",
-        call.tool_name,
-        short(&call.tool_input, 200)
-    );
+    println!("run {run}: approved {} with input", clean(&call.tool_name));
+    println!("{}", indent(&full_call(&call.tool_input), "  "));
     if crate::daemon::is_running(&cfg.state_dir) {
         println!("goose-triggers resumes its goose session now; that exact call may run once.");
     } else {
@@ -247,6 +261,20 @@ pub fn reject(cfg: &Config, run: i64) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn full_call_is_whole_and_terminal_safe() {
+        let input = crate::util::canonical_json(
+            &json!({"path": "/a", "content": "line1\nline2\u{1b}[2J\u{9b}x"}),
+        );
+        let shown = full_call(&input);
+        assert!(shown.contains("\"path\": \"/a\""), "{shown}");
+        assert!(
+            !shown.chars().any(|c| c.is_control() && c != '\n'),
+            "{shown:?}"
+        );
+        assert!(shown.contains("line1\\nline2"), "{shown}");
+    }
 
     #[test]
     fn describes_goose_messages() {

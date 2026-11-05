@@ -64,6 +64,15 @@ CREATE TABLE IF NOT EXISTS timeline (
     at INTEGER NOT NULL,
     what TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    tool_call_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS decisions_call ON decisions(run_id, tool_call_id);
 CREATE TABLE IF NOT EXISTS folder_seen (
     rule TEXT NOT NULL,
     folder TEXT NOT NULL,
@@ -180,7 +189,8 @@ pub fn matches_hold(patterns: &[String], tool: &str) -> bool {
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            crate::util::create_private_dir(dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(10))?;
@@ -403,68 +413,42 @@ impl Store {
         tool_call_id: Option<&str>,
     ) -> Result<PreTool> {
         let tx = self.immediate()?;
-        let row: Option<(String, String)> = tx
-            .query_row(
-                "SELECT state, holds FROM runs WHERE id = ?1",
-                [run_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((st, holds)) = row else {
-            bail!("run {run_id} is not in the store");
-        };
-        if st == state::HELD {
-            return Ok(PreTool::RunHeld);
-        }
-        if st != state::RUNNING {
-            return Ok(PreTool::NotRunning(st));
-        }
-        let holds: Vec<String> = serde_json::from_str(&holds).unwrap_or_default();
-        if !matches_hold(&holds, tool_name) {
-            return Ok(PreTool::Allowed);
-        }
-        let t = now();
-        let permission: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM permissions WHERE run_id = ?1 AND tool_name = ?2 AND tool_input = ?3 AND state = 'open' ORDER BY id LIMIT 1",
-                params![run_id, tool_name, tool_input],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(pid) = permission {
+        let outcome = decide_call(&tx, run_id, tool_name, tool_input, tool_call_id)?;
+        if let Some(cid) = tool_call_id {
+            // Every call the hook saw: the runner checks that each tool goose ran was seen.
+            let what = match &outcome {
+                PreTool::Allowed => "allowed",
+                PreTool::AllowedByApproval => "approved",
+                PreTool::Held(_) => "held",
+                PreTool::RunHeld | PreTool::NotRunning(_) => "denied",
+            };
             tx.execute(
-                "UPDATE permissions SET state = 'used', closed_at = ?2 WHERE id = ?1",
-                params![pid, t],
+                "INSERT INTO decisions (run_id, tool_call_id, tool_name, decision, at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![run_id, cid, tool_name, what, now()],
             )?;
-            log_in(
-                &tx,
-                Some(run_id),
-                &format!("approved call made: {tool_name} {tool_input}"),
-            )?;
-            tx.commit()?;
-            return Ok(PreTool::AllowedByApproval);
         }
-        // An approval is for one call: once the run stops at another, earlier ones lapse.
-        tx.execute(
-            "UPDATE permissions SET state = 'lapsed', closed_at = ?2 WHERE run_id = ?1 AND state = 'open'",
-            params![run_id, t],
-        )?;
-        tx.execute(
-            "INSERT INTO calls (run_id, tool_name, tool_input, tool_call_id, state, created_at) VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
-            params![run_id, tool_name, tool_input, tool_call_id, t],
-        )?;
-        let call_id = tx.last_insert_rowid();
-        tx.execute(
-            "UPDATE runs SET state = 'held', updated_at = ?2 WHERE id = ?1",
-            params![run_id, t],
-        )?;
-        log_in(
-            &tx,
-            Some(run_id),
-            &format!("held: {tool_name} {tool_input}"),
-        )?;
         tx.commit()?;
-        Ok(PreTool::Held(call_id))
+        Ok(outcome)
+    }
+
+    /// Whether the hook saw a call (by goose's tool call id) in a run.
+    pub fn hook_saw(&self, run_id: i64, tool_call_id: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM decisions WHERE run_id = ?1 AND tool_call_id = ?2",
+            params![run_id, tool_call_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Whether a run holds an approval not yet used.
+    pub fn has_open_permission(&self, run_id: i64) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM permissions WHERE run_id = ?1 AND state = 'open'",
+            [run_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
     }
 
     /// Approves the call a held run waits on: a one-time permission for that tool name and
@@ -619,6 +603,72 @@ impl Store {
     }
 }
 
+/// The hold decision for one call, inside the caller's transaction.
+fn decide_call(
+    tx: &Connection,
+    run_id: i64,
+    tool_name: &str,
+    tool_input: &str,
+    tool_call_id: Option<&str>,
+) -> Result<PreTool> {
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT state, holds FROM runs WHERE id = ?1",
+            [run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((st, holds)) = row else {
+        bail!("run {run_id} is not in the store");
+    };
+    if st == state::HELD {
+        return Ok(PreTool::RunHeld);
+    }
+    if st != state::RUNNING {
+        return Ok(PreTool::NotRunning(st));
+    }
+    let holds: Vec<String> = serde_json::from_str(&holds).unwrap_or_default();
+    if !matches_hold(&holds, tool_name) {
+        return Ok(PreTool::Allowed);
+    }
+    let t = now();
+    let permission: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM permissions WHERE run_id = ?1 AND tool_name = ?2 AND tool_input = ?3 AND state = 'open' ORDER BY id LIMIT 1",
+            params![run_id, tool_name, tool_input],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(pid) = permission {
+        tx.execute(
+            "UPDATE permissions SET state = 'used', closed_at = ?2 WHERE id = ?1",
+            params![pid, t],
+        )?;
+        log_in(
+            tx,
+            Some(run_id),
+            &format!("approved call made: {tool_name} {tool_input}"),
+        )?;
+        return Ok(PreTool::AllowedByApproval);
+    }
+    // An approval is for one call: once the run stops at another, earlier ones lapse.
+    tx.execute(
+        "UPDATE permissions SET state = 'lapsed', closed_at = ?2 WHERE run_id = ?1 AND state = 'open'",
+        params![run_id, t],
+    )?;
+    tx.execute(
+        "INSERT INTO calls (run_id, tool_name, tool_input, tool_call_id, state, created_at) VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+        params![run_id, tool_name, tool_input, tool_call_id, t],
+    )?;
+    let call_id = tx.last_insert_rowid();
+    tx.execute(
+        "UPDATE runs SET state = 'held', updated_at = ?2 WHERE id = ?1",
+        params![run_id, t],
+    )?;
+    log_in(tx, Some(run_id), &format!("held: {tool_name} {tool_input}"))?;
+    Ok(PreTool::Held(call_id))
+}
+
 fn log_in(conn: &Connection, run_id: Option<i64>, what: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO timeline (run_id, at, what) VALUES (?1, ?2, ?3)",
@@ -679,6 +729,8 @@ pub mod tests {
             PreTool::Allowed
         );
         let held = s.pre_tool_use(run, "shell", input, Some("call_1")).unwrap();
+        assert!(s.hook_saw(run, "call_1").unwrap());
+        assert!(!s.hook_saw(run, "call_x").unwrap());
         let PreTool::Held(call_id) = held else {
             panic!("{held:?}")
         };
@@ -694,6 +746,7 @@ pub mod tests {
 
         // Not running: approval cannot be made twice, and only for a held run.
         s.approve(run).unwrap();
+        assert!(s.has_open_permission(run).unwrap());
         assert!(s.approve(run).is_err());
         assert_eq!(s.run(run).unwrap().unwrap().state, state::APPROVED);
         assert!(matches!(

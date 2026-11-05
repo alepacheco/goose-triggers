@@ -79,6 +79,12 @@ pub fn decide(store: &Store, run: i64, payload: &Value) -> Result<Verdict> {
                 .context("PreToolUse payload without tool_name")?;
             let input = canonical_json(payload.get("tool_input").unwrap_or(&Value::Null));
             let call_id = payload.get("tool_call_id").and_then(Value::as_str);
+            if let Some(sid) = session {
+                // In case the session-start hook did not record it: approve resumes this session.
+                if store.set_session_if_unset(run, sid)? {
+                    store.log(Some(run), &format!("goose session {sid} recorded"))?;
+                }
+            }
             Ok(match store.pre_tool_use(run, tool, &input, call_id)? {
                 PreTool::Allowed | PreTool::AllowedByApproval => Verdict::Allow,
                 PreTool::Held(_) => Verdict::Block(format!(

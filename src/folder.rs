@@ -57,7 +57,9 @@ impl FolderWatch {
             .with_context(|| format!("rule {rule}: folder {}", folder.display()))?;
         Ok(FolderWatch {
             rule: rule.to_string(),
-            key: folder.to_string_lossy().into_owned(),
+            // Keyed by folder and pattern: files there when a pattern is first watched are
+            // not new, whatever the rule watched before.
+            key: format!("{}\n{pattern}", folder.display()),
             folder,
             pattern: glob::Pattern::new(pattern)?,
             pending: HashMap::new(),
