@@ -917,7 +917,12 @@ fn expansion(c: &[char], i: usize) -> (String, usize) {
     match (c[i], c.get(i + 1)) {
         ('`', _) => till(i + 1, '`', '`'),
         ('$', Some('(')) => till(i + 2, '(', ')'),
-        ('$', Some('{')) => till(i + 2, '{', '}'),
+        // `${...}`: a variable, or in bash 5.3 a command run in this shell (`${ cmd; }`);
+        // its text keeps the `${`, so it is never taken for the date.
+        ('$', Some('{')) => {
+            let (text, next) = till(i + 2, '{', '}');
+            (format!("${{{text}"), next)
+        }
         _ => {
             let mut j = i + 1;
             while c.get(j).is_some_and(|n| n.is_alphanumeric() || *n == '_') {
@@ -999,14 +1004,15 @@ fn simple_commands(l: &Lexed) -> Option<Vec<Simple>> {
 
 /// Whether a command substitution only prints the date: `date`, with a format or a plain
 /// option (never `-s`, which sets the clock), and nothing bash would read otherwise than as
-/// plain words or single-quoted text: no double quote, escape, comment, parenthesis or line
-/// break, so bash too ends the substitution at its first `)`.
+/// plain words or quoted text: no escape, comment, parenthesis, brace or line break, so bash
+/// too ends the substitution at its first `)`.
 fn is_date(text: &str) -> bool {
     let l = lex(text);
     let words: Vec<&str> = l.texts().collect();
     text.chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || " \t+%-:_./,'".contains(ch))
+        .all(|ch| ch.is_ascii_alphanumeric() || " \t+%-:_./,'\"".contains(ch))
         && text.matches('\'').count() % 2 == 0
+        && text.matches('"').count() % 2 == 0
         && l.active.is_empty()
         && l.toks.iter().all(|t| matches!(t, Tok::Word(_)))
         && words.first() == Some(&"date")
@@ -1060,20 +1066,34 @@ fn toward(marks: &[String], texts: &[String], tool: &str, input: &str) -> bool {
     has_mark(&without_event(&where_it_acts(tool, input), texts))
 }
 
-/// `toward` for a shell command; the script of `bash -c` or `sh -c` in it is read as a
-/// command too.
+/// `toward` for a shell command; the script a shell in it runs (`bash -c`, `sh -lc`,
+/// `/bin/bash -ec`, ...) is read as a command of its own.
 fn shell_toward(marks: &[String], texts: &[String], cmd: &str, depth: usize) -> bool {
     let has_mark = |t: &str| marks.iter().any(|m| t.contains(m.as_str()));
     let l = lex(cmd);
     let words: Vec<&str> = l.texts().collect();
+    let scripts: Vec<usize> = (2..words.len())
+        .filter(|&n| runs_script(&words, n))
+        .collect();
     l.active.iter().any(|a| has_mark(a))
-        || words.iter().any(|w| has_mark(&without_event(w, texts)))
-        || (depth < 2
-            && words.windows(3).any(|w| {
-                ["bash", "sh"].contains(&w[0])
-                    && ["-c", "-lc"].contains(&w[1])
-                    && shell_toward(marks, texts, w[2], depth + 1)
-            }))
+        || words.iter().enumerate().any(|(n, w)| {
+            if scripts.contains(&n) {
+                depth >= 2 || shell_toward(marks, texts, w, depth + 1)
+            } else {
+                has_mark(&without_event(w, texts))
+            }
+        })
+}
+
+/// Whether `words[n]` is the script a shell runs: it follows a shell program and an option
+/// with `c` in it (`bash -c`, `sh -lc`, `/bin/bash -ec`).
+fn runs_script(words: &[&str], n: usize) -> bool {
+    let shell = Path::new(words[n - 2])
+        .file_name()
+        .and_then(|f| f.to_str())
+        .is_some_and(|f| ["bash", "sh", "dash", "zsh", "ksh"].contains(&f));
+    let flag = words[n - 1];
+    shell && flag.starts_with('-') && !flag.starts_with("--") && flag.contains('c')
 }
 
 /// The recipe's own task in a run, as a careful user approving its held calls sees it: the
@@ -1199,6 +1219,21 @@ impl Task {
     /// the working folder; `test` or `[` on the task's files. Errors may go to `/dev/null`;
     /// no other redirection.
     fn simple_within(&self, s: &Simple, depth: usize) -> bool {
+        // `if ...; then ...; else ...; fi`: the reserved words aside, each part is a command.
+        let skip = usize::from(
+            s.words
+                .first()
+                .is_some_and(|w| ["if", "then", "else", "elif"].contains(&w.as_str())),
+        );
+        if s.redirects.is_empty() && (s.words == ["fi"] || (skip == 1 && s.words.len() == 1)) {
+            return true;
+        }
+        let s = &Simple {
+            words: s.words[skip..].to_vec(),
+            subbed: s.subbed[skip..].to_vec(),
+            redirects: s.redirects.clone(),
+            subbed_target: s.subbed_target,
+        };
         let Some(prog) = s.words.first() else {
             return false;
         };
@@ -1226,6 +1261,7 @@ impl Task {
         for (op, file) in &s.redirects {
             match op.as_str() {
                 "2>" | "2>>" if file == "/dev/null" => {}
+                "2>&" if file == "1" => {}
                 ">" | ">>" | "1>" | "1>>" if self.is_output(file) => writes = true,
                 "<<" | "<<-" => heredoc = true,
                 _ => return false,
@@ -1241,6 +1277,7 @@ impl Task {
         };
         match prog.as_str() {
             "echo" => !heredoc,
+            "true" | ":" => !writes && !heredoc && args.is_empty(),
             // No options: `printf -v` assigns a variable, whose subscript bash would run.
             "printf" => {
                 !heredoc
@@ -2850,6 +2887,7 @@ mod tests {
         for literal in [
             format!("file {}", crate::util::sh_quote(&path)),
             format!("file \"{escaped}\""),
+            format!("bash -lc 'file \"{escaped}\"'"),
         ] {
             let call = input(json!({ "command": literal }));
             assert!(t.within("shell", &call), "{literal}");
@@ -2937,6 +2975,10 @@ mod tests {
             "printf -x '%s' x >> entries.csv",
             "echo \"$(date '+)')\" >> entries.csv",
             "echo a=~/x >> entries.csv",
+            "echo \"${ date +%F; } Ada\" >> entries.csv",
+            "echo \"${ date +%F } ; rm -f x ; }\" >> entries.csv",
+            "if true; then rm x; fi",
+            "cat entries.csv 2>&3",
             // A substitution as the program, an option or a file.
             "$(date +%F) entries.csv",
             "echo x >> \"$(date +%F).csv\"",
@@ -2950,6 +2992,11 @@ mod tests {
             "cat >> entries.csv <<EOF\n$(date +%F) Ada\nEOF",
             "cat >> entries.csv <<'EOF'\nAda\\\nEOF",
             "printf -- '- %s\\n' \"$(date +%F)\" >> entries.csv",
+            "if [ ! -f entries.csv ]; then echo 'name,email' > entries.csv; fi; echo 'Ada,ada@example.com' >> entries.csv",
+            "if [ -f entries.csv ]; then\n  cat entries.csv\nelse\n  touch entries.csv\nfi",
+            "test -f entries.csv || true",
+            "cat entries.csv 2>&1",
+            "echo \"$(date \"+%F\") Ada\" >> entries.csv",
             "echo \"$(date '+%Y-%m-%d %H:%M') Ada\" >> entries.csv",
         ] {
             assert!(w1.within("shell", &input(json!({ "command": c }))), "{c}");

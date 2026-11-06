@@ -110,8 +110,16 @@ pub fn effective_provider(run: &Run) -> Option<String> {
 /// lists, then the user's `config.yaml`; a later file's setting wins), `active_provider`
 /// before `GOOSE_PROVIDER`.
 pub fn goose_default_provider() -> Option<String> {
-    for var in ["GOOSE_PROVIDER", "ACTIVE_PROVIDER"] {
-        if let Some(p) = std::env::var(var).ok().filter(|p| !p.is_empty()) {
+    if let Some(p) = std::env::var("GOOSE_PROVIDER")
+        .ok()
+        .filter(|p| !p.is_empty())
+    {
+        return Some(p);
+    }
+    // goose reads ACTIVE_PROVIDER as JSON first (a quoted name), then as text.
+    if let Ok(p) = std::env::var("ACTIVE_PROVIDER") {
+        let p = serde_json::from_str::<String>(&p).unwrap_or_else(|_| p.trim().to_string());
+        if !p.is_empty() {
             return Some(p);
         }
     }
