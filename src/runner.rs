@@ -329,6 +329,8 @@ struct Watched {
     saw_complete: bool,
     last_error: Option<String>,
     unseen_call: Option<String>,
+    /// goose's last lines of plain text.
+    said: Vec<String>,
 }
 
 fn run_goose(ctx: &Ctx, run: &Run, mode: &Mode) -> Result<()> {
@@ -390,7 +392,8 @@ fn run_goose(ctx: &Ctx, run: &Run, mode: &Mode) -> Result<()> {
         }
     };
     store.set_pid(run.id, None)?;
-    finish(&store, run, mode, &wd, watched)
+    let stderr_path = runs_dir.join(format!("{}.stderr", run.id));
+    finish(&store, run, mode, &wd, &stderr_path, watched)
 }
 
 fn watch(
@@ -429,6 +432,8 @@ fn watch(
     let mut hold: Option<(Instant, Option<String>)> = None;
     let mut saw_complete = false;
     let mut last_error: Option<String> = None;
+    // goose's last lines that are not JSON (its own error messages, say).
+    let mut said: Vec<String> = Vec::new();
     let mut unseen_call: Option<String> = None;
     let mut checked = Instant::now() - Duration::from_secs(1);
 
@@ -444,6 +449,13 @@ fn watch(
                        exited: bool|
      -> Result<()> {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
+            let text = line.trim();
+            if !text.is_empty() {
+                said.push(text.to_string());
+                if said.len() > 3 {
+                    said.remove(0);
+                }
+            }
             return Ok(());
         };
         match v.get("type").and_then(Value::as_str) {
@@ -536,10 +548,30 @@ fn watch(
         saw_complete,
         last_error,
         unseen_call,
+        said,
     })
 }
 
-fn finish(store: &Store, run: &Run, mode: &Mode, wd: &Path, w: Watched) -> Result<()> {
+/// The last `n` lines of a file that are not empty.
+pub fn tail(path: &Path, n: usize) -> Vec<String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    lines[lines.len().saturating_sub(n)..].to_vec()
+}
+
+fn finish(
+    store: &Store,
+    run: &Run,
+    mode: &Mode,
+    wd: &Path,
+    stderr_path: &Path,
+    w: Watched,
+) -> Result<()> {
     let cur = store.run(run.id)?.context("the run left the store")?;
     let id = run.id;
     let say_log = |what: &str| -> Result<()> {
@@ -583,20 +615,37 @@ fn finish(store: &Store, run: &Run, mode: &Mode, wd: &Path, w: Watched) -> Resul
         }
         return fail("goose-triggers was stopped while the run was going");
     }
+    if !w.status.success() {
+        // goose's own reason first: its error event, else what it printed last.
+        let why = w
+            .last_error
+            .clone()
+            .or_else(|| (!w.said.is_empty()).then(|| w.said.join(" / ")))
+            .or_else(|| {
+                let t = tail(stderr_path, 3);
+                (!t.is_empty()).then(|| t.join(" / "))
+            });
+        return fail(&format!(
+            "goose exited with {}{}; see goose-triggers log {id}",
+            w.status,
+            why.map(|e| format!(": {}", short(&e, 300)))
+                .unwrap_or_default()
+        ));
+    }
     if cur.session_id.is_none() {
         return fail(&format!(
             "goose did not run goose-triggers' plugin hooks (no session was recorded); check that goose loads plugins from {}",
             wd.join(".agents/plugins").display()
         ));
     }
-    if w.status.success() && w.saw_complete {
+    if w.saw_complete {
         if store.transition(id, &[state::RUNNING], state::DONE, None)? {
             say_log("done")?;
         }
         return Ok(());
     }
     fail(&format!(
-        "goose exited with {}{}; see goose-triggers log {id}",
+        "goose exited ({}) without finishing its turn{}; see goose-triggers log {id}",
         w.status,
         w.last_error
             .map(|e| format!(": {}", short(&e, 300)))

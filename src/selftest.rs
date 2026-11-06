@@ -449,8 +449,13 @@ impl Selftest {
     }
 }
 
-fn goose_version(goose: &str) -> Result<String> {
-    let out = Command::new(goose).arg("--version").output().with_context(|| {
+fn goose_version(goose: &str, root: &Path) -> Result<String> {
+    // With goose's folders in the selftest's own folder, like every goose it runs.
+    let out = Command::new(goose)
+        .arg("--version")
+        .env("GOOSE_PATH_ROOT", root)
+        .output()
+        .with_context(|| {
         format!("running `{goose} --version`: install goose (https://goose-docs.ai/docs/getting-started/installation) or pass --goose <path>")
     })?;
     if !out.status.success() {
@@ -472,7 +477,6 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
         Some(p) => p.to_string_lossy().into_owned(),
         None => "goose".into(),
     };
-    let version = goose_version(&goose)?;
     let dir = std::env::temp_dir().join(format!(
         "goose-triggers-selftest-{}-{}",
         std::process::id(),
@@ -482,6 +486,13 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
     for d in ["inbox", "recipes", "work", "goose-root", "state"] {
         std::fs::create_dir_all(dir.join(d))?;
     }
+    let version = match goose_version(&goose, &dir.join("goose-root")) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
     println!(
         "goose-triggers {} selftest with goose {version}",
         env!("CARGO_PKG_VERSION")
