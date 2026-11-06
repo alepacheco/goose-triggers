@@ -91,11 +91,16 @@ enum Cmd {
         /// The real model, as the provider names it (qwen3:8b, ...); needs --provider
         #[arg(long, value_name = "NAME", requires = "provider")]
         model: Option<String>,
-        /// With a real model: also send this many plain entries (at most 10) and approve every call they are held at, to see what the model does after an approval
+        /// With a real model: also send this many plain entries (at most 10) and approve the calls they are held at (at most 6 a run, the later ones rejected), to see what the model does after an approval
         #[arg(long, value_name = "N", default_value_t = 0, requires = "provider")]
         approvals: usize,
-        /// With a real model: how long one run may take, in minutes
-        #[arg(long, value_name = "MINUTES", default_value_t = 20)]
+        /// With a real model: how long one run may go on, in minutes; the suite stops a run that takes longer and shows it as timed out
+        #[arg(
+            long,
+            value_name = "MINUTES",
+            default_value_t = 20,
+            requires = "provider"
+        )]
         run_minutes: u64,
     },
     /// Called by goose through goose-triggers' plugin hooks; not for direct use

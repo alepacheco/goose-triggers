@@ -44,10 +44,12 @@ jobs:
           set -euo pipefail
           # The release's assets may still be uploading when it is published: wait for them.
           name="goose-triggers-$TAG-x86_64-linux.tar.gz"
+          digest=""
           for i in $(seq 1 30); do
             curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/$REPO/releases/tags/$TAG" > "$RUNNER_TEMP/release.json"
-            digest=$(jq -r --arg n "$name" '.assets[] | select(.name == $n and .state == "uploaded") | .digest' "$RUNNER_TEMP/release.json")
+              "https://api.github.com/repos/$REPO/releases/tags/$TAG" > "$RUNNER_TEMP/release.json" \
+              || { sleep 10; continue; }
+            digest=$(jq -r --arg n "$name" '.assets[] | select(.name == $n and .state == "uploaded") | .digest // empty' "$RUNNER_TEMP/release.json")
             sums=$(jq -r --arg n "$name.sha256" '[.assets[] | select(.name == $n and .state == "uploaded")] | length' "$RUNNER_TEMP/release.json")
             if [ -n "$digest" ] && [ "$sums" = 1 ]; then break; fi
             sleep 10

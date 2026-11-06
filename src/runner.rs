@@ -104,26 +104,45 @@ pub fn effective_provider(run: &Run) -> Option<String> {
     goose_default_provider()
 }
 
-/// The provider goose uses when neither the rule nor the recipe names one: `GOOSE_PROVIDER`,
-/// else the one goose's own config sets.
+/// The provider goose uses when neither the rule nor the recipe names one, found as goose
+/// 1.57.0 finds it: `GOOSE_PROVIDER`, then `ACTIVE_PROVIDER`, then its config files merged in
+/// its order (the system-wide `/etc/goose/config.yaml`, each file `GOOSE_ADDITIONAL_CONFIG_FILES`
+/// lists, then the user's `config.yaml`; a later file's setting wins), `active_provider`
+/// before `GOOSE_PROVIDER`.
 pub fn goose_default_provider() -> Option<String> {
-    if let Some(p) = std::env::var("GOOSE_PROVIDER")
-        .ok()
-        .filter(|p| !p.is_empty())
-    {
-        return Some(p);
+    for var in ["GOOSE_PROVIDER", "ACTIVE_PROVIDER"] {
+        if let Some(p) = std::env::var(var).ok().filter(|p| !p.is_empty()) {
+            return Some(p);
+        }
     }
-    let text =
-        std::fs::read_to_string(crate::plugin::goose_config_dir().join("config.yaml")).ok()?;
-    provider_in_goose_config(&text)
+    let mut files = vec![PathBuf::from("/etc/goose/config.yaml")];
+    if let Some(list) = std::env::var_os("GOOSE_ADDITIONAL_CONFIG_FILES") {
+        files.extend(std::env::split_paths(&list));
+    }
+    files.push(crate::plugin::goose_config_dir().join("config.yaml"));
+    let layers: Vec<String> = files
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .collect();
+    provider_in_goose_configs(&layers)
 }
 
-/// The provider goose's config file (its text) sets.
-fn provider_in_goose_config(text: &str) -> Option<String> {
-    let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(text).ok()?;
-    ["active_provider", "GOOSE_PROVIDER"]
+/// The provider goose's config files (their texts, in goose's order) set, read as goose 1.57.0
+/// reads its merged config: with a `providers` block, `active_provider` (else the old
+/// `GOOSE_PROVIDER` key); without one, goose moves `GOOSE_PROVIDER` to `active_provider`.
+fn provider_in_goose_configs(layers: &[String]) -> Option<String> {
+    let docs: Vec<serde_yaml_ng::Value> = layers
         .iter()
-        .find_map(|k| v.get(*k).and_then(|p| p.as_str()).map(str::to_string))
+        .filter_map(|t| serde_yaml_ng::from_str(t).ok())
+        .collect();
+    // A top-level key of the merged config: the last file's that sets it.
+    let last = |k: &str| docs.iter().rev().find_map(|v| v.get(k));
+    let text = |k: &str| last(k).and_then(|p| p.as_str()).map(str::to_string);
+    if last("providers").is_some() {
+        text("active_provider").or_else(|| text("GOOSE_PROVIDER"))
+    } else {
+        text("GOOSE_PROVIDER").or_else(|| text("active_provider"))
+    }
 }
 
 fn check_provider(run: &Run) -> Result<()> {
@@ -839,17 +858,49 @@ mod tests {
 
     #[test]
     fn reads_the_provider_goose_config_sets() {
+        let one = |t: &str| provider_in_goose_configs(&[t.to_string()]);
         assert_eq!(
-            provider_in_goose_config("GOOSE_PROVIDER: claude-code\nGOOSE_MODEL: x\n").as_deref(),
+            one("GOOSE_PROVIDER: claude-code\nGOOSE_MODEL: x\n").as_deref(),
             Some("claude-code")
         );
         assert_eq!(
-            provider_in_goose_config("active_provider: ollama\nGOOSE_PROVIDER: openai\n")
-                .as_deref(),
+            one("active_provider: ollama\nproviders:\n  ollama: {enabled: true}\nGOOSE_PROVIDER: openai\n").as_deref(),
             Some("ollama")
         );
-        assert_eq!(provider_in_goose_config("GOOSE_MODEL: x\n"), None);
-        assert_eq!(provider_in_goose_config(": not yaml ["), None);
+        assert_eq!(one("GOOSE_MODEL: x\n"), None);
+        assert_eq!(one(": not yaml ["), None);
+    }
+
+    #[test]
+    fn a_later_goose_config_file_wins_and_active_provider_first() {
+        let layers = |ts: &[&str]| {
+            provider_in_goose_configs(&ts.iter().map(|t| t.to_string()).collect::<Vec<_>>())
+        };
+        // The system-wide file sets a CLI-agent provider and the user's file none: it is used.
+        assert_eq!(
+            layers(&["active_provider: claude-acp\n", "GOOSE_MODEL: x\n"]).as_deref(),
+            Some("claude-acp")
+        );
+        // A later file overrides an earlier one.
+        assert_eq!(
+            layers(&["active_provider: claude-acp\n", "active_provider: ollama\n"]).as_deref(),
+            Some("ollama")
+        );
+        // With a providers block, active_provider comes before the old GOOSE_PROVIDER key;
+        // without one, goose moves GOOSE_PROVIDER to active_provider.
+        assert_eq!(
+            layers(&[
+                "active_provider: openai\nproviders: {}\n",
+                "GOOSE_PROVIDER: claude-code\n"
+            ])
+            .as_deref(),
+            Some("openai")
+        );
+        assert_eq!(
+            layers(&["active_provider: openai\n", "GOOSE_PROVIDER: claude-code\n"]).as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(layers(&[]), None);
     }
 
     #[test]

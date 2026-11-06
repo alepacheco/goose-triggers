@@ -1,6 +1,6 @@
 # Reviews and install tests
 
-One folder per release. Each holds the automated code reviews of the change since the release before (`code-review-<round>.md`, in order: each round after the first reviews the change with the fixes for the round before) and the clean-install test of the release (`install-test.md`), as written, with internal references such as build machine paths removed. What a review found was fixed before the release; what an install test found went into the next release.
+One folder per release. Each holds the automated code reviews of the change since the release before (from 0.0.2 on `code-review-<round>.md`, in order: each round after the first reviews the change with the fixes for the round before; 0.0.1's single review is `code-review.md`) and the clean-install test of the release (`install-test.md`), as written, with internal references such as build machine paths removed. From 0.0.2 on, what a review found was fixed before the release (0.0.1's review came after its release, and its finding was fixed in 0.0.2); what an install test found went into the next release.
 
 | release | code reviews | install test |
 |---|---|---|

@@ -89,6 +89,9 @@ pub(crate) fn wait_for<T>(
 ) -> Result<T> {
     let start = Instant::now();
     loop {
+        if interrupted() {
+            bail!("interrupted");
+        }
         if let Some(v) = f()? {
             return Ok(v);
         }
@@ -190,7 +193,6 @@ impl Harness {
             .stderr(Stdio::from(log))
             .spawn()
             .context("starting goose-triggers run")?;
-        DAEMON_PID.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
         self.daemon = Some(child);
         let listen = self.listen.clone();
         wait_for("the webhook listener", Duration::from_secs(20), || {
@@ -213,7 +215,6 @@ impl Harness {
         let Some(mut d) = self.daemon.take() else {
             return Ok(());
         };
-        DAEMON_PID.store(0, std::sync::atomic::Ordering::SeqCst);
         // SAFETY: SIGTERM to the daemon this selftest started.
         unsafe {
             libc::kill(d.id() as libc::pid_t, libc::SIGTERM);
@@ -236,7 +237,7 @@ impl Harness {
         &self,
         run: i64,
         answer: &str,
-    ) -> Result<(std::process::ExitStatus, String)> {
+    ) -> Result<Option<(std::process::ExitStatus, String)>> {
         use std::io::Write;
         use std::os::fd::{FromRawFd, OwnedFd};
         // SAFETY: posix_openpt returns a descriptor this process then owns; grantpt, unlockpt
@@ -244,7 +245,8 @@ impl Harness {
         let (master, slave) = unsafe {
             let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
             if fd < 0 {
-                bail!("posix_openpt: {}", std::io::Error::last_os_error());
+                // No pseudo-terminal here (a sandbox without /dev/ptmx): the check is skipped.
+                return Ok(None);
             }
             let master = OwnedFd::from_raw_fd(fd);
             let mut name = [0 as libc::c_char; 128];
@@ -278,14 +280,14 @@ impl Harness {
         let out = crate::util::wait_output(&mut child, Duration::from_secs(20))?
             .context("approve on a terminal did not end within 20 s")?;
         drop(master);
-        Ok((
+        Ok(Some((
             out.status,
             format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             ),
-        ))
+        )))
     }
 
     fn run_of(&self, rule: &str) -> Result<Option<Run>> {
@@ -437,15 +439,19 @@ impl Harness {
         )?;
 
         // On a terminal, approve asks; any answer but yes leaves the run held, exit status 1.
-        let (declined, said) = self.approve_on_terminal(folder_run, "n\n")?;
-        let still_held = self
-            .store()?
-            .run(folder_run)?
-            .is_some_and(|r| r.state == state::HELD);
-        self.check(
-            !declined.success() && said.contains("Approve this call?") && said.contains("not approved") && still_held,
-            &format!("goose-triggers approve {folder_run} on a terminal, answered n: not approved, exit status {}, the run still held", declined.code().unwrap_or(-1)),
-        )?;
+        match self.approve_on_terminal(folder_run, "n\n")? {
+            Some((declined, said)) => {
+                let still_held = self
+                    .store()?
+                    .run(folder_run)?
+                    .is_some_and(|r| r.state == state::HELD);
+                self.check(
+                    declined.code() == Some(1) && said.contains("Approve this call?") && said.contains("not approved") && still_held,
+                    &format!("goose-triggers approve {folder_run} on a terminal, answered n: not approved, exit status {}, the run still held", declined.code().unwrap_or(-1)),
+                )?;
+            }
+            None => println!("  skip goose-triggers approve on a terminal: no pseudo-terminal can be opened here"),
+        }
 
         // Approve: the same session resumes, the approved call runs once, the run finishes.
         self.cli(&["approve", &folder_run.to_string(), "--yes"])?;
@@ -759,18 +765,20 @@ impl Harness {
 
 /// Set by SIGINT or SIGTERM during a selftest or hostile suite.
 static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// The `goose-triggers run` the selftest or suite has started, if any (0: none).
-static DAEMON_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 extern "C" fn on_interrupt(_: libc::c_int) {
-    INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    if INTERRUPTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        // A second Ctrl-C: leave at once, as a user who presses it twice expects.
+        // SAFETY: _exit is async-signal-safe.
+        unsafe { libc::_exit(130) }
+    }
 }
 
-/// On SIGINT or SIGTERM (Ctrl-C), stops the `goose-triggers run` started for the test, removes
-/// its temporary folder `dir` (unless `keep`) and exits with status 130.
-pub(crate) fn clean_up_on_interrupt(dir: &Path, keep: bool) {
-    use std::sync::atomic::Ordering;
-    // SAFETY: the handler only stores to an atomic.
+/// Lets a selftest or hostile suite be stopped with Ctrl-C (SIGINT) or SIGTERM: the waits it
+/// makes then fail with "interrupted", and the command stops what it started and calls
+/// `finish_interrupted`. A second signal exits at once.
+pub(crate) fn catch_interrupt() {
+    // SAFETY: the handler only stores to an atomic, or calls _exit.
     unsafe {
         libc::signal(
             libc::SIGINT,
@@ -781,36 +789,28 @@ pub(crate) fn clean_up_on_interrupt(dir: &Path, keep: bool) {
             on_interrupt as *const () as libc::sighandler_t,
         );
     }
-    let dir = dir.to_path_buf();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_millis(100));
-        if !INTERRUPTED.load(Ordering::SeqCst) {
-            continue;
+}
+
+/// Whether Ctrl-C or SIGTERM came.
+pub(crate) fn interrupted() -> bool {
+    INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// After an interrupted selftest or suite has stopped its `goose-triggers run`: removes its
+/// temporary folder `dir` (unless `keep`), says so, and exits with status 130.
+pub(crate) fn finish_interrupted(dir: &Path, keep: bool) -> ! {
+    if keep {
+        println!("interrupted; its files: {}", dir.display());
+    } else {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => println!("interrupted; its temporary folder is removed"),
+            Err(e) => println!(
+                "interrupted; its temporary folder {} could not be removed: {e}",
+                dir.display()
+            ),
         }
-        let pid = DAEMON_PID.swap(0, Ordering::SeqCst);
-        if pid > 0 {
-            // SAFETY: SIGTERM to the daemon this test started, then reaping it if it is still
-            // this process's child (waitpid fails once the main thread has reaped it).
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-            let start = Instant::now();
-            while start.elapsed() < Duration::from_secs(30) {
-                let mut status = 0;
-                if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } != 0 {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-        if keep {
-            println!("interrupted; its files: {}", dir.display());
-        } else {
-            let _ = std::fs::remove_dir_all(&dir);
-            println!("interrupted; its temporary folder is removed");
-        }
-        std::process::exit(130);
-    });
+    }
+    std::process::exit(130)
 }
 
 /// The writing end of a pipe whose reading end is closed already: every write to it fails.
@@ -852,7 +852,7 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
         crate::util::now()
     ));
     crate::util::create_private_dir(&dir)?;
-    clean_up_on_interrupt(&dir, keep);
+    catch_interrupt();
     for d in ["inbox", "recipes", "work", "goose-root", "state"] {
         std::fs::create_dir_all(dir.join(d))?;
     }
@@ -921,10 +921,13 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
         dir: dir.clone(),
     };
     let result = t.steps();
-    if result.is_err() {
+    if result.is_err() || interrupted() {
         let _ = t.stop_daemon();
     }
     drop(model);
+    if interrupted() {
+        finish_interrupted(&dir, keep);
+    }
     match result {
         Ok(()) => {
             println!("selftest passed: {} checks", t.checks);

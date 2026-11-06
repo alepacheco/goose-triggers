@@ -46,9 +46,12 @@ fn an_interrupted_selftest_stops_its_daemon_and_removes_its_folder() {
         std::process::id()
     ));
     std::fs::create_dir_all(&tmp).unwrap();
+    use std::os::unix::process::CommandExt;
+    // In a process group of its own, as a shell runs a command at a terminal.
     let child = Command::new(env!("CARGO_BIN_EXE_goose-triggers"))
         .args(["selftest", "--goose", &goose])
         .env("TMPDIR", &tmp)
+        .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -67,9 +70,10 @@ fn an_interrupted_selftest_stops_its_daemon_and_removes_its_folder() {
         std::thread::sleep(Duration::from_millis(100));
     }
     std::thread::sleep(Duration::from_millis(500));
-    // SAFETY: SIGINT to the selftest this test started, as Ctrl-C sends it.
+    // SAFETY: SIGINT to the process group of the selftest this test started (the selftest and
+    // the `goose-triggers run` and goose it started), as Ctrl-C at a terminal sends it.
     unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGINT);
     }
     let out = child.wait_with_output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);

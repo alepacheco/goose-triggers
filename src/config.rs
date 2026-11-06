@@ -137,7 +137,8 @@ impl Config {
                 path.display()
             );
         }
-        let raw: RawConfig = serde_yaml_ng::from_value(doc)
+        // Parsed again from the text, so an error says where it is (a Value has no positions).
+        let raw: RawConfig = serde_yaml_ng::from_str(text)
             .with_context(|| format!("reading the config file {}", path.display()))?;
         let base = path
             .parent()
