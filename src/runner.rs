@@ -89,37 +89,14 @@ pub fn spawn(ctx: Ctx, run: Run, mode: Mode) -> JoinHandle<()> {
     })
 }
 
-/// The provider a run's goose would use: the rule's, the recipe's, `GOOSE_PROVIDER`, or
-/// goose's config.
-pub fn effective_provider(run: &Run) -> Option<String> {
-    if let Some(p) = &run.provider {
-        return Some(p.clone());
-    }
-    if let Some(p) = crate::recipe::read(Path::new(&run.recipe))
-        .ok()
-        .and_then(|i| i.provider)
-    {
-        return Some(p);
-    }
-    goose_default_provider()
-}
-
 /// The provider goose uses when neither the rule nor the recipe names one, found as goose
-/// 1.57.0 finds it: `GOOSE_PROVIDER`, then `ACTIVE_PROVIDER`, then its config files merged in
-/// its order (the system-wide `/etc/goose/config.yaml`, each file `GOOSE_ADDITIONAL_CONFIG_FILES`
-/// lists, then the user's `config.yaml`; a later file's setting wins), `active_provider`
-/// before `GOOSE_PROVIDER`.
+/// 1.57.0 finds it (`get_active_provider`): `GOOSE_PROVIDER`; then `active_provider` through
+/// `get_param` (the `ACTIVE_PROVIDER` variable, else goose's config files merged in its order:
+/// the system-wide `/etc/goose/config.yaml`, each file `GOOSE_ADDITIONAL_CONFIG_FILES` lists,
+/// then the user's `config.yaml`, a later file's setting winning); then `GOOSE_PROVIDER` from
+/// those files.
 pub fn goose_default_provider() -> Option<String> {
-    if let Some(p) = std::env::var("GOOSE_PROVIDER")
-        .ok()
-        .filter(|p| !p.is_empty())
-    {
-        return Some(p);
-    }
-    if let Some(p) = std::env::var("ACTIVE_PROVIDER")
-        .ok()
-        .and_then(|v| active_provider_env(&v))
-    {
+    if let Ok(p) = std::env::var("GOOSE_PROVIDER") {
         return Some(p);
     }
     let mut files = vec![PathBuf::from("/etc/goose/config.yaml")];
@@ -131,48 +108,86 @@ pub fn goose_default_provider() -> Option<String> {
         .iter()
         .filter_map(|f| std::fs::read_to_string(f).ok())
         .collect();
-    provider_in_goose_configs(&layers)
+    match std::env::var("ACTIVE_PROVIDER") {
+        Err(_) => provider_in_goose_configs(&layers, true),
+        Ok(v) => match active_provider_env(&v) {
+            Some(name) => Some(name),
+            // goose's get_param fails on it and does not read the files' active_provider.
+            None => provider_in_goose_configs(&layers, false),
+        },
+    }
 }
 
 /// The provider an `ACTIVE_PROVIDER` value names, read as goose 1.57.0 reads it
-/// (`parse_env_value`): JSON first, then `true`, `false` or a number, else the text. A value
-/// that is not a name (a number, a boolean, null) is passed over, as goose passes over it.
+/// (`parse_env_value`): JSON first, then `true`, `false` or a finite number, else the text.
+/// A value that is not a name (a number, a boolean, null, a list) is none, as goose fails on it.
 fn active_provider_env(v: &str) -> Option<String> {
     let t = v.trim();
-    let name = match serde_json::from_str::<serde_json::Value>(v) {
+    match serde_json::from_str::<serde_json::Value>(v) {
         Ok(serde_json::Value::String(s)) => Some(s),
         Ok(_) => None,
         Err(_) if ["true", "false"].contains(&t.to_lowercase().as_str()) => None,
-        Err(_) if t.parse::<f64>().is_ok() => None,
+        Err(_) if t.parse::<f64>().is_ok_and(f64::is_finite) => None,
         Err(_) => Some(v.to_string()),
-    };
-    name.filter(|n| !n.is_empty())
+    }
 }
 
 /// The provider goose's config files (their texts, in goose's order) set, read as goose 1.57.0
-/// reads them for a run (`get_active_provider`): `active_provider`, else `GOOSE_PROVIDER`, each
-/// from the last file that sets it.
-fn provider_in_goose_configs(layers: &[String]) -> Option<String> {
+/// reads them for a run: `active_provider` (unless `with_active` is false), then
+/// `GOOSE_PROVIDER`, each from the merged files, where the last file that has the key wins
+/// whatever its value; a value that is not text is passed over, as goose fails on it.
+fn provider_in_goose_configs(layers: &[String], with_active: bool) -> Option<String> {
     let docs: Vec<serde_yaml_ng::Value> = layers
         .iter()
         .filter_map(|t| serde_yaml_ng::from_str(t).ok())
         .collect();
-    ["active_provider", "GOOSE_PROVIDER"].iter().find_map(|k| {
+    let keys: &[&str] = if with_active {
+        &["active_provider", "GOOSE_PROVIDER"]
+    } else {
+        &["GOOSE_PROVIDER"]
+    };
+    keys.iter().find_map(|k| {
         docs.iter()
             .rev()
-            .find_map(|v| v.get(*k).and_then(|p| p.as_str()).map(str::to_string))
+            .find_map(|v| v.get(*k))
+            .and_then(|p| p.as_str())
+            .map(str::to_string)
     })
 }
 
-fn check_provider(run: &Run) -> Result<()> {
-    if let Some(p) = effective_provider(run) {
-        if is_cli_agent_provider(&p) {
-            bail!(
-                "provider {p} hands the run to another agent, which runs its own tools: goose's hooks do not see those calls, so the rule's holds could not be enforced. Use a provider for which goose runs the tools (an API provider or a local model)"
-            );
-        }
+/// The providers goose may run a rule's runs on. A provider the rule names is passed to goose
+/// as `--provider`, at the start and at every resume, and goose uses only that. Otherwise goose
+/// starts on the recipe's (else its default), and when it resumes a run whose provider it
+/// cannot set up again (a key that is no longer set), it goes on with its default provider:
+/// both count.
+pub fn providers_goose_may_use(rule: Option<&str>, recipe: Option<String>) -> Vec<String> {
+    match rule {
+        Some(p) => vec![p.to_string()],
+        None => recipe.into_iter().chain(goose_default_provider()).collect(),
     }
-    Ok(())
+}
+
+/// Refuses a rule with holds that goose may run on a CLI-agent provider.
+pub fn check_providers(providers: &[String]) -> Result<()> {
+    let Some(p) = providers.iter().find(|p| is_cli_agent_provider(p)) else {
+        return Ok(());
+    };
+    let why = "hands runs to another agent, which runs its own tools: goose's hooks do not see those calls, so the rule's holds could not be enforced";
+    if providers.len() > 1 && providers.last() == Some(p) {
+        bail!(
+            "goose's default provider {p} {why}; goose falls back to it when it resumes a run whose own provider it cannot set up again (a key no longer set). Name the rule's provider on the rule (provider:), which goose-triggers passes to goose at every start and resume, or make goose's default a provider for which goose runs the tools"
+        );
+    }
+    bail!(
+        "provider {p} {why}. Use a provider for which goose runs the tools (an API provider or a local model)"
+    )
+}
+
+fn check_provider(run: &Run) -> Result<()> {
+    let recipe = crate::recipe::read(Path::new(&run.recipe))
+        .ok()
+        .and_then(|i| i.provider);
+    check_providers(&providers_goose_may_use(run.provider.as_deref(), recipe))
 }
 
 /// Checks a held run's working folder before goose starts there: goose-triggers' plugin is
@@ -877,7 +892,7 @@ mod tests {
 
     #[test]
     fn reads_the_provider_goose_config_sets() {
-        let one = |t: &str| provider_in_goose_configs(&[t.to_string()]);
+        let one = |t: &str| provider_in_goose_configs(&[t.to_string()], true);
         assert_eq!(
             one("GOOSE_PROVIDER: claude-code\nGOOSE_MODEL: x\n").as_deref(),
             Some("claude-code")
@@ -900,15 +915,55 @@ mod tests {
             active_provider_env("\"claude-code\"").as_deref(),
             Some("claude-code")
         );
-        for v in ["1", "true", "null", "2.5", "", "\"\""] {
+        for v in ["1", "true", "False", "null", "2.5", "[1]"] {
             assert_eq!(active_provider_env(v), None, "{v}");
         }
+        // goose keeps these as text: a name (that no provider has).
+        for v in ["", "\"\"", "inf", "NaN"] {
+            assert!(active_provider_env(v).is_some(), "{v}");
+        }
+    }
+
+    #[test]
+    fn when_active_provider_is_not_a_name_only_goose_provider_counts() {
+        // goose's get_param fails on ACTIVE_PROVIDER=1 and does not read the files'
+        // active_provider; it takes GOOSE_PROVIDER from them.
+        let layers = [
+            "active_provider: openai\n".to_string(),
+            "GOOSE_PROVIDER: claude-code\n".to_string(),
+        ];
+        assert_eq!(
+            provider_in_goose_configs(&layers, false).as_deref(),
+            Some("claude-code")
+        );
+        // A later file's empty active_provider (null) wins the merge, and goose fails on it.
+        let layers = [
+            "active_provider: openai\nGOOSE_PROVIDER: claude-code\n".to_string(),
+            "active_provider:\n".to_string(),
+        ];
+        assert_eq!(
+            provider_in_goose_configs(&layers, true).as_deref(),
+            Some("claude-code")
+        );
+    }
+
+    #[test]
+    fn a_rule_with_no_provider_is_refused_when_goose_may_fall_back_to_a_cli_agent() {
+        // The recipe names an API provider, goose's default is a CLI agent: goose falls back to
+        // the default when it resumes a run whose provider it cannot set up again.
+        let e = check_providers(&["anthropic".into(), "cursor-agent".into()]).unwrap_err();
+        assert!(format!("{e}").contains("cursor-agent"), "{e}");
+        assert!(format!("{e}").contains("on the rule (provider:)"), "{e}");
+        assert!(check_providers(&["claude-code".into()]).is_err());
+        assert!(check_providers(&["anthropic".into(), "openai".into()]).is_ok());
+        assert!(check_providers(&["ollama".into()]).is_ok());
+        assert!(check_providers(&[]).is_ok());
     }
 
     #[test]
     fn a_later_goose_config_file_wins_and_active_provider_first() {
         let layers = |ts: &[&str]| {
-            provider_in_goose_configs(&ts.iter().map(|t| t.to_string()).collect::<Vec<_>>())
+            provider_in_goose_configs(&ts.iter().map(|t| t.to_string()).collect::<Vec<_>>(), true)
         };
         let one_file = |t: &str| layers(&[t]);
         // The system-wide file sets a CLI-agent provider and the user's file none: it is used.

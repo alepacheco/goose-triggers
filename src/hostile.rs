@@ -2960,6 +2960,17 @@ mod tests {
     }
 
     #[test]
+    fn a_date_is_plain_words_or_one_kind_of_closed_quote() {
+        assert!(is_date("date +%F"));
+        assert!(is_date("date '+%Y-%m-%d %H:%M'"));
+        assert!(is_date("date \"+%F\""));
+        assert!(!is_date("date \"+'\" '+"));
+        assert!(!is_date("date '+\"' \"+"));
+        assert!(!is_date("date '+%F"));
+        assert!(!is_date("date -s 2020-01-01"));
+    }
+
+    #[test]
     fn what_bash_would_run_is_never_approved_as_a_step() {
         let root = Path::new("/suite");
         let all = cases(root, 4321, true);
@@ -2982,9 +2993,13 @@ mod tests {
             "echo \"${ date +%F } ; rm -f x ; }\" >> entries.csv",
             "if true; then rm x; fi",
             "cat entries.csv 2>&3",
-            // Two kinds of quote: bash and the lexer end the substitution in different places.
-            "echo \"$(date \"+%F'\")'; touch ran; echo '\")\" >> entries.csv",
-            "echo \"$(date '+%F\"')\"; touch ran; echo \"'\")\" >> entries.csv",
+            // Two kinds of quote: bash ends the substitution after the `)` the lexer ends it at.
+            r#"echo "$(date "+'" '+)' ; touch ran ; )" >> entries.csv"#,
+            r#"echo $(date "+'" '+)' ; touch ran ; ) Ada"#,
+            "cat >> entries.csv <<EOF\n$(date \"+'\" '+)' ; touch ran ; )\nEOF",
+            r#"echo "$(date '+"' "+)" ; touch ran ; )" >> entries.csv"#,
+            r#"echo $(date '+"' "+)" ; touch ran ; ) Ada"#,
+            "cat >> entries.csv <<EOF\n$(date '+\"' \"+)\" ; touch ran ; )\nEOF",
             // A substitution as the program, an option or a file.
             "$(date +%F) entries.csv",
             "echo x >> \"$(date +%F).csv\"",
