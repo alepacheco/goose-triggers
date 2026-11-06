@@ -37,6 +37,9 @@ pub fn hooks_json(exe: &Path) -> Value {
             "SessionStart": [
                 {"hooks": [{"type": "command", "command": cmd, "timeout": 30}]}
             ],
+            "UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": cmd, "timeout": 30}]}
+            ],
             "PreToolUse": [
                 {"hooks": [{"type": "command", "command": cmd, "timeout": 30, "on_failure": "block"}]}
             ]

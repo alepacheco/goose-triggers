@@ -359,6 +359,11 @@ impl Selftest {
             r.session_id.as_deref() == Some(folder_session.as_str()),
             &format!("run {folder_run} resumed goose session {folder_session} and is done"),
         )?;
+        let turns = self.store()?.turn_count(folder_run)?;
+        self.check(
+            turns >= 2,
+            &format!("goose ran goose-triggers' hooks at the start of each goose run of it ({turns} turns)"),
+        )?;
         let notes = std::fs::read_to_string(self.dir.join("work/folder/selftest-notes.txt"))
             .unwrap_or_default();
         self.check(

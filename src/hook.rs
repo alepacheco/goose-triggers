@@ -3,6 +3,7 @@
 //! goose passes the hook event as JSON on stdin and the run's environment, in which the
 //! runner set `GOOSE_TRIGGERS_RUN` (the run) and `GOOSE_TRIGGERS_DB` (the store).
 //! - `SessionStart`: records the goose session the run started, which `approve` resumes.
+//! - `UserPromptSubmit`: notes that goose runs the plugin's hooks in this turn.
 //! - `PreToolUse`: a call to a tool the rule holds is denied with a reason and stored as
 //!   pending, and the run becomes held; the runner then stops goose. A call that matches the
 //!   one-time permission an approval gave goes through once.
@@ -70,6 +71,12 @@ pub fn decide(store: &Store, run: i64, payload: &Value) -> Result<Verdict> {
                     store.log(Some(run), &format!("goose session {sid} started"))?;
                 }
             }
+            Ok(Verdict::Allow)
+        }
+        "UserPromptSubmit" => {
+            // goose runs this at the start of each turn, before any tool call: it shows the
+            // runner that this goose process runs goose-triggers' hooks.
+            store.note_turn(run)?;
             Ok(Verdict::Allow)
         }
         "PreToolUse" => {

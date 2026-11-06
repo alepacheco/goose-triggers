@@ -108,7 +108,7 @@ pub fn handle(
 /// Starts the listener; it serves until `stop` is set.
 /// At most this many requests are handled at once; more get 503.
 const MAX_REQUESTS: usize = 16;
-/// A client gets this long for each read and write.
+/// A client gets this long to send its whole request, and for each write of the reply.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The request line and headers may take at most this much.
 const MAX_HEAD: usize = 16 << 10;
@@ -122,6 +122,7 @@ fn respond(mut stream: &TcpStream, r: Reply) {
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         411 => "Length Required",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
@@ -136,13 +137,49 @@ fn respond(mut stream: &TcpStream, r: Reply) {
         body.len()
     );
     let _ = stream.flush();
-    let _ = stream.shutdown(std::net::Shutdown::Both);
+    // Closing with unread request bytes would reset the connection before the client reads
+    // the reply: stop writing, take briefly what the client still sends, then close.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let start = std::time::Instant::now();
+    let mut sink = [0u8; 8192];
+    let mut taken = 0;
+    while taken < 4 * MAX_BODY && start.elapsed() < Duration::from_secs(1) {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => taken += n,
+        }
+    }
+}
+
+/// Reads a connection with one deadline for the whole request, however slowly the client
+/// sends it.
+struct Deadline<'a> {
+    stream: &'a TcpStream,
+    until: std::time::Instant,
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self
+            .until
+            .saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the request took too long",
+            ));
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        let mut stream = self.stream;
+        stream.read(buf)
+    }
 }
 
 /// The request line and headers: (method, target, headers with lower-case names).
 type Head = (String, String, Vec<(String, String)>);
 
-fn read_head(reader: &mut BufReader<&TcpStream>) -> std::result::Result<Head, u16> {
+fn read_head(reader: &mut BufReader<Deadline>) -> std::result::Result<Head, u16> {
     let mut lines = Vec::new();
     let mut total = 0;
     loop {
@@ -151,7 +188,16 @@ fn read_head(reader: &mut BufReader<&TcpStream>) -> std::result::Result<Head, u1
             .by_ref()
             .take((MAX_HEAD - total + 1) as u64)
             .read_line(&mut line)
-            .map_err(|_| 400u16)?;
+            .map_err(|e| {
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) {
+                    408u16
+                } else {
+                    400u16
+                }
+            })?;
         total += n;
         if n == 0 || total > MAX_HEAD {
             return Err(if total > MAX_HEAD { 431 } else { 400 });
@@ -176,9 +222,11 @@ fn read_head(reader: &mut BufReader<&TcpStream>) -> std::result::Result<Head, u1
 /// One connection, one request, on a thread of its own: reads time out, and a body is read
 /// only after the rule and the secret are checked, and only as far as its 64 KiB cap.
 fn serve_one(cfg: &Config, secret: &str, stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-    let mut reader = BufReader::new(&stream);
+    let mut reader = BufReader::new(Deadline {
+        stream: &stream,
+        until: std::time::Instant::now() + IO_TIMEOUT,
+    });
     let (method, target, headers) = match read_head(&mut reader) {
         Ok(h) => h,
         Err(status) => {
@@ -215,6 +263,16 @@ fn serve_one(cfg: &Config, secret: &str, stream: TcpStream) {
             }
         },
     };
+    let authorized = header("authorization")
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .is_some_and(|given| same_secret(given.as_bytes(), secret.as_bytes()));
+    if length > 0
+        && length <= MAX_BODY as u64
+        && authorized
+        && header("expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue"))
+    {
+        let _ = (&stream).write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
     let mut body = reader.take(length.min(MAX_BODY as u64 + 1));
     let store = match Store::open(&cfg.db_path()) {
         Ok(s) => s,

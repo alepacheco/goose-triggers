@@ -452,7 +452,25 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// How many calls the hook has decided on in a run.
+    /// Notes that the hook ran at the start of a turn of the run.
+    pub fn note_turn(&self, run_id: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO decisions (run_id, tool_call_id, tool_name, decision, at) VALUES (?1, '', '', 'turn', ?2)",
+            params![run_id, now()],
+        )?;
+        Ok(())
+    }
+
+    /// How many turns of a run the hook saw start.
+    pub fn turn_count(&self, run_id: i64) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM decisions WHERE run_id = ?1 AND decision = 'turn'",
+            [run_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// How many calls (and turns) the hook has seen in a run.
     pub fn decision_count(&self, run_id: i64) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM decisions WHERE run_id = ?1",

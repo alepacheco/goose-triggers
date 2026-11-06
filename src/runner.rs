@@ -196,6 +196,9 @@ fn goose_command(ctx: &Ctx, run: &Run, mode: &Mode, wd: &Path, stderr: File) -> 
     cmd.args(["--output-format", "stream-json"]);
     cmd.current_dir(wd)
         .env("GOOSE_MODE", "auto")
+        // A message starting with `/` would otherwise run one of the user's slash-command
+        // recipes, whose extensions start where no hook sees them.
+        .env("GOOSE_SLASH_COMMANDS_ENABLED", "false")
         .env(ENV_RUN, run.id.to_string())
         .env(ENV_DB, &ctx.db)
         .stdin(Stdio::null())

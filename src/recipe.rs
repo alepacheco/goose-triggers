@@ -299,6 +299,8 @@ pub fn same_shape(
         (a, Y::String(b)) if tokens.iter().any(|(t, _)| b.contains(t.as_str())) => {
             text && is_scalar(a)
         }
+        // In a text field, a filter or a condition may reshape the text a value filled in.
+        (a, b) if text && is_scalar(a) && is_scalar(b) => true,
         (a, b) => a == b,
     }
 }
@@ -347,6 +349,12 @@ prompt: "{{ file_path }} {{ note }} {{ who }}"
         assert!(same_recipe(&real, &template, &t));
         // A number that came from a value, in a text field.
         assert!(same_recipe(&y("prompt: 5\n"), &y("prompt: 'TOKEN0'\n"), &t));
+        // Text a filter or a condition reshaped (`{{ x | upper }}`, `{% if %}`).
+        assert!(same_recipe(
+            &y("prompt: 'For SALES'\n"),
+            &y("prompt: 'For GOOSETRIGGERS'\n"),
+            &t
+        ));
     }
 
     #[test]
@@ -357,10 +365,10 @@ prompt: "{{ file_path }} {{ note }} {{ who }}"
         let added_item = y("prompt: 'x'\nextensions: [{type: builtin, name: developer}, {type: stdio, name: e, cmd: sh}]\n");
         assert!(!same_recipe(&added_key, &template, &t));
         assert!(!same_recipe(&added_item, &template, &t));
-        // Text without a token must not change.
-        let template = y("title: fixed\nprompt: 'TOKEN0'\n");
+        // Outside the text fields nothing may change, token or not.
+        let template = y("prompt: 'TOKEN0'\nsettings: {max_turns: 3}\n");
         assert!(!same_recipe(
-            &y("title: other\nprompt: 'x'\n"),
+            &y("prompt: 'x'\nsettings: {max_turns: 4}\n"),
             &template,
             &t
         ));
