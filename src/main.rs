@@ -55,7 +55,7 @@ enum Cmd {
     Approve {
         /// The run's number, as `status` shows it
         run: i64,
-        /// Approve without asking (it asks only when run from a terminal)
+        /// Approve without asking (needed when not run from a terminal)
         #[arg(long, short)]
         yes: bool,
     },
@@ -82,6 +82,16 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Cmd::Hook = cli.command {
         return ExitCode::from(hook::main_hook());
+    }
+    if let Cmd::Status { .. } | Cmd::Log { .. } | Cmd::Approve { .. } | Cmd::Reject { .. } =
+        cli.command
+    {
+        // These print for a reader that may stop reading (`status | head`): end quietly then,
+        // as other command-line tools do, rather than fail on the closed pipe.
+        // SAFETY: restores the default action of one signal before any thread starts.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
     }
     let result = match cli.command {
         Cmd::Run => config::Config::load(cli.config.as_deref()).and_then(daemon::run),

@@ -262,6 +262,11 @@ pub fn run(cfg: Config) -> Result<()> {
     let exe = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .context("finding the goose-triggers binary")?;
+    let goose = crate::util::goose_version(
+        &cfg.goose,
+        &[],
+        "set `goose:` in the config to the goose binary",
+    )?;
     for rule in &cfg.rules {
         check_rule(rule, &exe)?;
     }
@@ -332,7 +337,11 @@ pub fn run(cfg: Config) -> Result<()> {
             }
         }
     }
-    say(&format!("state in {}", cfg.state_dir.display()));
+    say(&format!(
+        "goose {} ({goose}); state in {}",
+        cfg.goose,
+        cfg.state_dir.display()
+    ));
 
     let mut active: Active = Vec::new();
     let mut last_poll: Option<Instant> = None;

@@ -210,7 +210,6 @@ fn render(
     wd: &Path,
     hide_env: Option<&str>,
 ) -> Result<serde_yaml_ng::Value> {
-    use std::io::Read;
     let mut cmd = std::process::Command::new(goose);
     cmd.arg("run").arg("--recipe").arg(recipe);
     for (k, v) in params {
@@ -218,10 +217,7 @@ fn render(
     }
     cmd.arg("--render-recipe")
         .current_dir(wd)
-        .env_remove(crate::hook::ENV_RUN)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .env_remove(crate::hook::ENV_RUN);
     if let Some(var) = hide_env {
         cmd.env_remove(var);
     }
@@ -238,36 +234,19 @@ fn render(
             });
         }
     }
-    let mut child = cmd.spawn().with_context(|| format!("running {goose}"))?;
-    let mut stdout = child.stdout.take().context("goose's output")?;
-    let mut stderr = child.stderr.take().context("goose's errors")?;
-    let out_reader = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = stdout.read_to_end(&mut b);
-        b
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = stderr.read_to_end(&mut b);
-        b
-    });
-    let start = std::time::Instant::now();
-    let status = loop {
-        if let Some(st) = child.try_wait()? {
-            break st;
-        }
-        if start.elapsed() > RENDER_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "goose took over {} s to render the recipe",
-                RENDER_TIMEOUT.as_secs()
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    let Some(output) = crate::util::output_within(&mut cmd, RENDER_TIMEOUT)
+        .with_context(|| format!("running {goose}"))?
+    else {
+        bail!(
+            "goose took over {} s to render the recipe",
+            RENDER_TIMEOUT.as_secs()
+        );
     };
-    let out = out_reader.join().unwrap_or_default();
-    let err = err_reader.join().unwrap_or_default();
+    let std::process::Output {
+        status,
+        stdout: out,
+        stderr: err,
+    } = output;
     if !status.success() {
         let text = format!(
             "{}{}",

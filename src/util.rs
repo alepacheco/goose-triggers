@@ -168,10 +168,116 @@ pub fn is_cli_agent_provider(name: &str) -> bool {
     CLI_AGENTS.contains(&name) || name.ends_with("-acp")
 }
 
+/// Runs a short command to its end, reading its output whole, and kills it if it takes over
+/// `limit`: its output, or None when it took too long.
+pub fn output_within(
+    cmd: &mut std::process::Command,
+    limit: std::time::Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    // Read on threads of their own, so a full pipe never stops the command.
+    let out_reader = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(s) = stdout.as_mut() {
+            let _ = s.read_to_end(&mut b);
+        }
+        b
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(s) = stderr.as_mut() {
+            let _ = s.read_to_end(&mut b);
+        }
+        b
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    Ok(Some(std::process::Output {
+        status,
+        stdout: out_reader.join().unwrap_or_default(),
+        stderr: err_reader.join().unwrap_or_default(),
+    }))
+}
+
+/// `goose --version`: checks that the goose binary runs, and says which goose it is. `hint`
+/// says how to point goose-triggers at another goose.
+pub fn goose_version(goose: &str, env: &[(&str, &Path)], hint: &str) -> anyhow::Result<String> {
+    let mut cmd = std::process::Command::new(goose);
+    cmd.arg("--version");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = match output_within(&mut cmd, std::time::Duration::from_secs(60)) {
+        Ok(Some(out)) => out,
+        Ok(None) => anyhow::bail!("`{goose} --version` took over 60 s"),
+        Err(e) => anyhow::bail!(
+            "running `{goose} --version`: {e}: install goose (https://goose-docs.ai/docs/getting-started/installation) or {hint}"
+        ),
+    };
+    if !out.status.success() {
+        anyhow::bail!("`{goose} --version` failed ({}): {hint}", out.status);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_missing_goose_is_named_with_the_hint() {
+        let e = goose_version("/nonexistent/goose", &[], "set `goose:` in the config")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("/nonexistent/goose") && e.contains("set `goose:` in the config"),
+            "{e}"
+        );
+        // A command that runs but is not goose (it fails on --version) is refused too.
+        let e = goose_version("false", &[], "set `goose:`")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`false --version` failed"), "{e}");
+    }
+
+    #[test]
+    fn output_within_reads_big_output_and_stops_slow_commands() {
+        let mut big = std::process::Command::new("sh");
+        big.args(["-c", "head -c 300000 /dev/zero; echo err >&2"]);
+        let out = output_within(&mut big, std::time::Duration::from_secs(20))
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.stdout.len(), 300000);
+        assert_eq!(out.stderr, b"err\n");
+        let mut slow = std::process::Command::new("sleep");
+        slow.arg("30");
+        let start = std::time::Instant::now();
+        assert!(
+            output_within(&mut slow, std::time::Duration::from_millis(200))
+                .unwrap()
+                .is_none()
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
 
     #[test]
     fn canonical_json_ignores_key_order_and_spacing() {

@@ -4,8 +4,10 @@
 //! there -> approve -> the same goose session resumes -> the approved call runs -> done;
 //! approve -> a differing call is held again -> reject -> the run ends, nothing ran;
 //! an event whose value would add a command to the recipe -> refused before goose runs;
-//! a run goose fails -> failed with goose's own reason, none of the event's values in it;
-//! events refused before goose runs -> their reasons quote none of the sender's text.
+//! a run goose fails -> failed with goose's own reason, none of the event's values in it,
+//! its goose session found by name; events refused before goose runs -> their reasons quote
+//! none of the sender's text; an approval not yet resumed -> withdrawn by reject; status and
+//! log -> end quietly on a closed pipe.
 //! Everything happens in a temporary folder, with goose's own folders there too
 //! (`GOOSE_PATH_ROOT`), so the user's goose settings and sessions are not touched.
 
@@ -356,9 +358,20 @@ impl Selftest {
             "goose-triggers run started again; status lists both held runs",
         )?;
 
+        // Off a terminal, approve needs --yes.
+        let refused = self.cli(&["approve", &folder_run.to_string()]);
+        let still_held = self
+            .store()?
+            .run(folder_run)?
+            .is_some_and(|r| r.state == state::HELD);
+        self.check(
+            refused.as_ref().is_err_and(|e| e.to_string().contains("--yes")) && still_held,
+            &format!("goose-triggers approve {folder_run} with no terminal to ask on and no --yes: refused, the run still held"),
+        )?;
+
         // Approve: the same session resumes, the approved call runs once, the run finishes.
-        self.cli(&["approve", &folder_run.to_string()])?;
-        self.ok(&format!("goose-triggers approve {folder_run}"));
+        self.cli(&["approve", &folder_run.to_string(), "--yes"])?;
+        self.ok(&format!("goose-triggers approve {folder_run} --yes"));
         let r = self.wait_state(FOLDER_RULE, state::DONE)?;
         self.check(
             r.session_id.as_deref() == Some(folder_session.as_str()),
@@ -384,8 +397,8 @@ impl Selftest {
         )?;
 
         // A call that differs from the approved one is held again; reject ends the run.
-        self.cli(&["approve", &webhook_run.to_string()])?;
-        self.ok(&format!("goose-triggers approve {webhook_run}"));
+        self.cli(&["approve", &webhook_run.to_string(), "--yes"])?;
+        self.ok(&format!("goose-triggers approve {webhook_run} --yes"));
         let want = canonical_json(&json!({"command": webhook_changed_command("A-1001")}));
         let call = wait_for("the differing call to be held", WAIT, || {
             let s = self.store()?;
@@ -466,11 +479,19 @@ impl Selftest {
             )
         })?;
         let error = r.error.unwrap_or_default();
+        let fail_session = r.session_id.clone().unwrap_or_default();
         let log = self.cli(&["log", &fail_run.to_string()])?;
         self.check(
             log.lines()
                 .any(|l| l.contains("goose printed: ") && l.contains(MISSING_PROVIDER)),
             &format!("goose-triggers log {fail_run} shows what goose printed: its error"),
+        )?;
+        // goose made the run's session before it failed, though no hook of the run ran.
+        self.check(
+            !fail_session.is_empty()
+                && self.timeline_has(fail_run, "found by its name")?
+                && log.contains(&format!("goose session: {fail_session}")),
+            &format!("run {fail_run}: goose's session for it ({fail_session}) is named, found by its name though goose failed before the hooks ran"),
         )?;
         // goose printed none of the event's values either (it runs with --quiet).
         let printed = ["jsonl", "stderr"].iter().any(|ext| {
@@ -575,6 +596,58 @@ impl Selftest {
             ),
         )?;
 
+        // An approval not yet resumed (goose-triggers stopped) can be withdrawn by reject.
+        let (st, reply) = http(
+            &self.listen,
+            "POST",
+            &format!("/hooks/{WEBHOOK_RULE}"),
+            Some(&secret),
+            r#"{"order": "A-3003"}"#,
+        )?;
+        self.check(
+            st == 202,
+            &format!("webhook event accepted (202 {})", reply.trim()),
+        )?;
+        let late_run = self.wait_state(WEBHOOK_RULE, state::HELD)?.id;
+        self.stop_daemon()?;
+        self.cli(&["approve", &late_run.to_string(), "--yes"])?;
+        let status = self.cli(&["status"])?;
+        let out = self.cli(&["reject", &late_run.to_string()])?;
+        let s = self.store()?;
+        let r = s.run(late_run)?.context("run gone")?;
+        let calls: Vec<String> = s.calls(late_run)?.into_iter().map(|c| c.state).collect();
+        let open = s.has_open_permission(late_run)?;
+        drop(s);
+        let orders = std::fs::read_to_string(self.dir.join("work/webhook/selftest-orders.txt"))
+            .unwrap_or_default();
+        self.check(
+            status.contains("withdraws it")
+                && out.contains("withdrew the approval")
+                && r.state == state::REJECTED
+                && calls == ["rejected"]
+                && !open
+                && self.timeline_has(late_run, "approval withdrawn")?
+                && !orders.contains("A-3003"),
+            &format!("run {late_run} held, approved while goose-triggers was stopped, then rejected: the approval withdrawn, the run ended, the call never ran"),
+        )?;
+
+        // status and log end quietly when their reader goes away (`status | head`).
+        let mut quiet = true;
+        for args in [vec!["status", "--all"], vec!["log", "1"], vec!["log"]] {
+            let out = self
+                .command(&args)
+                .stdout(closed_pipe()?)
+                .stderr(Stdio::piped())
+                .output()?;
+            use std::os::unix::process::ExitStatusExt;
+            let ended = out.status.success() || out.status.signal() == Some(libc::SIGPIPE);
+            quiet &= ended && out.stderr.is_empty();
+        }
+        self.check(
+            quiet,
+            "status and log end quietly when their output is closed (a pipe to head)",
+        )?;
+
         let log = self.cli(&["log", &folder_run.to_string()])?;
         self.check(
             log.contains("approved call made")
@@ -585,25 +658,24 @@ impl Selftest {
                     .is_some_and(|(_, s)| s.contains("Error: Headless run interrupted")),
             "goose-triggers log shows the run's story, goose's stderr included (goose stopped at the hold)",
         )?;
-        self.stop_daemon()?;
         self.ok("goose-triggers run stopped");
         Ok(())
     }
 }
 
-fn goose_version(goose: &str, root: &Path) -> Result<String> {
-    // With goose's folders in the selftest's own folder, like every goose it runs.
-    let out = Command::new(goose)
-        .arg("--version")
-        .env("GOOSE_PATH_ROOT", root)
-        .output()
-        .with_context(|| {
-        format!("running `{goose} --version`: install goose (https://goose-docs.ai/docs/getting-started/installation) or pass --goose <path>")
-    })?;
-    if !out.status.success() {
-        bail!("`{goose} --version` failed");
+/// The writing end of a pipe whose reading end is closed already: every write to it fails.
+fn closed_pipe() -> Result<Stdio> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe2 fills both descriptors, which this process then owns; the reading end is
+    // closed at once, the writing end is handed to an OwnedFd.
+    unsafe {
+        if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+            bail!("pipe: {}", std::io::Error::last_os_error());
+        }
+        libc::close(fds[0]);
+        Ok(Stdio::from(OwnedFd::from_raw_fd(fds[1])))
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn yaml_str(p: &Path) -> String {
@@ -628,7 +700,13 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
     for d in ["inbox", "recipes", "work", "goose-root", "state"] {
         std::fs::create_dir_all(dir.join(d))?;
     }
-    let version = match goose_version(&goose, &dir.join("goose-root")) {
+    // With goose's folders in the selftest's own folder, like every goose it runs.
+    let root = dir.join("goose-root");
+    let version = match crate::util::goose_version(
+        &goose,
+        &[("GOOSE_PATH_ROOT", root.as_path())],
+        "pass --goose <path>",
+    ) {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&dir);
@@ -648,7 +726,7 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
     let secret = format!("selftest-{}-{:x}", std::process::id(), crate::util::now());
     let config = dir.join("config.yaml");
     let cfg = format!(
-        "state_dir: {state}\ngoose: {goose}\nwebhook:\n  listen: {listen}\n  secret_env: {SECRET_ENV}\nrules:\n  - name: {FOLDER_RULE}\n    folder: {inbox}\n    pattern: \"*.txt\"\n    recipe: {folder}\n    hold: [shell]\n    working_dir: {wf}\n  - name: {WEBHOOK_RULE}\n    webhook: true\n    recipe: {webhook}\n    hold: [shell]\n    working_dir: {ww}\n  - name: {FAIL_RULE}\n    webhook: true\n    recipe: {webhook}\n    hold: [shell]\n    provider: {MISSING_PROVIDER}\n    working_dir: {wx}\n",
+        "state_dir: {state}\ngoose: {goose}\nwebhook:\n  listen: {listen}\n  secret_env: {SECRET_ENV}\nrules:\n  - name: {FOLDER_RULE}\n    folder: {inbox}\n    pattern: \"*.txt\"\n    recipe: {folder}\n    hold: [shell, write, edit]\n    working_dir: {wf}\n  - name: {WEBHOOK_RULE}\n    webhook: true\n    recipe: {webhook}\n    hold: [shell, write, edit]\n    working_dir: {ww}\n  - name: {FAIL_RULE}\n    webhook: true\n    recipe: {webhook}\n    hold: [shell, write, edit]\n    provider: {MISSING_PROVIDER}\n    working_dir: {wx}\n",
         state = yaml_str(&dir.join("state")),
         goose = serde_json::to_string(&goose)?,
         inbox = yaml_str(&dir.join("inbox")),

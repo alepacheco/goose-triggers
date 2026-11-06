@@ -513,7 +513,8 @@ impl Store {
         self.decide(run_id, true, Some(expected))
     }
 
-    /// Rejects the call a held run waits on: the run ends.
+    /// Rejects the call a held run waits on, or withdraws the approval of a run that has not
+    /// resumed yet: the run ends.
     pub fn reject(&self, run_id: i64) -> Result<Call> {
         self.decide(run_id, false, None)
     }
@@ -525,20 +526,30 @@ impl Store {
                 r.get(0)
             })
             .optional()?;
-        match st.as_deref() {
+        // An approved run that goose-triggers has not resumed yet can still be rejected: its
+        // approval is withdrawn before the call is made. Once it runs, it is too late.
+        let waiting_on = match st.as_deref() {
             None => bail!("there is no run {run_id}"),
-            Some(state::HELD) => {}
+            Some(state::HELD) => "pending",
+            Some(state::APPROVED) if !approve => "approved",
+            Some(state::APPROVED) => bail!("run {run_id} is approved already"),
             Some(other) => bail!("run {run_id} is {other}, not held"),
-        }
+        };
         let call = tx
             .query_row(
                 "SELECT id, run_id, tool_name, tool_input, tool_call_id, state, created_at FROM calls
-                 WHERE run_id = ?1 AND state = 'pending' ORDER BY id DESC LIMIT 1",
-                [run_id],
+                 WHERE run_id = ?1 AND state = ?2 ORDER BY id DESC LIMIT 1",
+                params![run_id, waiting_on],
                 Self::call_from_row,
             )
             .optional()?
-            .with_context(|| format!("run {run_id} is held but has no pending call"))?;
+            .with_context(|| format!("run {run_id} has no {waiting_on} call"))?;
+        if waiting_on == "approved" {
+            tx.execute(
+                "UPDATE permissions SET state = 'withdrawn', closed_at = ?2 WHERE run_id = ?1 AND state = 'open'",
+                params![run_id, now()],
+            )?;
+        }
         if expected.is_some_and(|e| e != call.id) {
             bail!("run {run_id} now waits on another call than the one shown: look at it again (goose-triggers log {run_id})");
         }
@@ -562,13 +573,15 @@ impl Store {
             "UPDATE runs SET state = ?2, updated_at = ?3 WHERE id = ?1",
             params![run_id, run_state, t],
         )?;
+        let what = if waiting_on == "approved" {
+            "approval withdrawn, rejected by the user"
+        } else {
+            &format!("{call_state} by the user")
+        };
         log_in(
             &tx,
             Some(run_id),
-            &format!(
-                "{call_state} by the user: {} {}",
-                call.tool_name, call.tool_input
-            ),
+            &format!("{what}: {} {}", call.tool_name, call.tool_input),
         )?;
         tx.commit()?;
         Ok(call)
@@ -850,6 +863,50 @@ pub mod tests {
             )
             .unwrap();
         assert_eq!(lapsed, 1);
+    }
+
+    #[test]
+    fn reject_withdraws_an_approval_not_yet_resumed() {
+        let (s, _) = temp_store("withdraw");
+        let run = running_run(&s, &["shell"]);
+        let input = r#"{"command":"rm -r out"}"#;
+        assert!(matches!(
+            s.pre_tool_use(run, "shell", input, Some("c1")).unwrap(),
+            PreTool::Held(_)
+        ));
+        s.approve(run).unwrap();
+        assert!(s.has_open_permission(run).unwrap());
+        let call = s.reject(run).unwrap();
+        assert_eq!(
+            (call.tool_name.as_str(), call.tool_input.as_str()),
+            ("shell", input)
+        );
+        let r = s.run(run).unwrap().unwrap();
+        assert_eq!(r.state, state::REJECTED);
+        assert!(!s.has_open_permission(run).unwrap());
+        // The runner can no longer resume it, and the call never goes through.
+        assert!(!s
+            .transition(run, &[state::APPROVED], state::RUNNING, None)
+            .unwrap());
+        assert!(matches!(
+            s.pre_tool_use(run, "shell", input, Some("c2")).unwrap(),
+            PreTool::NotRunning(_)
+        ));
+        let states: Vec<String> = s.calls(run).unwrap().into_iter().map(|c| c.state).collect();
+        assert_eq!(states, ["rejected"]);
+        assert!(s
+            .timeline(run)
+            .unwrap()
+            .iter()
+            .any(|l| l.what.starts_with("approval withdrawn")));
+        // A run that resumed is past withdrawing.
+        let run = running_run(&s, &["shell"]);
+        s.pre_tool_use(run, "shell", input, Some("c3")).unwrap();
+        s.approve(run).unwrap();
+        s.transition(run, &[state::APPROVED], state::RUNNING, None)
+            .unwrap();
+        let e = s.reject(run).unwrap_err().to_string();
+        assert!(e.contains("running, not held"), "{e}");
     }
 
     #[test]

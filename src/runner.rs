@@ -178,8 +178,7 @@ fn goose_command(ctx: &Ctx, run: &Run, mode: &Mode, wd: &Path, stderr: File) -> 
             for (k, v) in &run.params {
                 cmd.arg("--params").arg(format!("{k}={v}"));
             }
-            cmd.arg("--name")
-                .arg(format!("goose-triggers {} run {}", run.rule, run.id));
+            cmd.arg("--name").arg(session_name(run));
         }
         Mode::Resume(text) => {
             let sid = run
@@ -229,6 +228,52 @@ fn goose_command(ctx: &Ctx, run: &Run, mode: &Mode, wd: &Path, stderr: File) -> 
         }
     }
     Ok(cmd)
+}
+
+/// The name goose-triggers gives a run's goose session.
+fn session_name(run: &Run) -> String {
+    format!("goose-triggers {} run {}", run.rule, run.id)
+}
+
+/// The goose session a run's goose made, found among the sessions goose lists by its name and
+/// working folder, made no earlier than `since` (Unix seconds): for a run that goose ended
+/// before goose-triggers' hooks recorded its session (goose failed before the model's first
+/// turn, say).
+fn find_session(ctx: &Ctx, run: &Run, wd: &Path, since: i64) -> Option<String> {
+    let mut cmd = Command::new(&ctx.cfg.goose);
+    cmd.args(["session", "list", "--format", "json", "--working_dir"])
+        .arg(wd)
+        .current_dir(wd)
+        .env_remove(ENV_RUN);
+    if let Some(var) = hidden_env(ctx) {
+        cmd.env_remove(var);
+    }
+    let out = crate::util::output_within(&mut cmd, Duration::from_secs(30)).ok()??;
+    if !out.status.success() {
+        return None;
+    }
+    let list: Value = serde_json::from_slice(&out.stdout).ok()?;
+    pick_session(&list, &session_name(run), wd, since)
+}
+
+/// The newest session in goose's session list (`goose session list --format json`) with this
+/// name and working folder, made at `since` or later.
+fn pick_session(list: &Value, name: &str, wd: &Path, since: i64) -> Option<String> {
+    list.as_array()?
+        .iter()
+        .filter(|s| {
+            s.get("name").and_then(Value::as_str) == Some(name)
+                && s.get("working_dir").and_then(Value::as_str).map(Path::new) == Some(wd)
+        })
+        .filter_map(|s| {
+            let at = chrono::DateTime::parse_from_rfc3339(s.get("created_at")?.as_str()?)
+                .ok()?
+                .timestamp();
+            let id = s.get("id")?.as_str()?.to_string();
+            (at >= since).then_some((at, id))
+        })
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, id)| id)
 }
 
 /// A tool response in goose's output.
@@ -403,6 +448,7 @@ fn run_goose(ctx: &Ctx, run: &Run, mode: &Mode) -> Result<()> {
     if !store.transition(run.id, &[from], state::RUNNING, None)? {
         return Ok(());
     }
+    let started = crate::util::now();
     let mut child = cmd
         .spawn()
         .with_context(|| format!("starting goose ({})", ctx.cfg.goose))?;
@@ -414,13 +460,27 @@ fn run_goose(ctx: &Ctx, run: &Run, mode: &Mode) -> Result<()> {
             return Err(e);
         }
     };
+    // goose has exited: whether its hooks recorded the run's session is settled.
+    let hook_session = store.run(run.id)?.is_some_and(|r| r.session_id.is_some());
+    if matches!(mode, Mode::Start) && !hook_session {
+        // goose may have made the session and ended before the hooks ran: name it anyway, so
+        // the user can open it.
+        if let Some(sid) = find_session(ctx, run, &wd, started) {
+            if store.set_session_if_unset(run.id, &sid)? {
+                store.log(
+                    Some(run.id),
+                    &format!("goose session {sid} (found by its name: goose ended before goose-triggers' hooks ran)"),
+                )?;
+            }
+        }
+    }
     store.set_pid(run.id, None)?;
     let stderr = tail(
         &runs_dir.join(format!("{}.stderr", run.id)),
         stderr_from,
         STDERR_LINES,
     );
-    finish(&store, run, mode, &wd, &stderr, watched)
+    finish(&store, run, mode, &wd, &stderr, hook_session, watched)
 }
 
 fn watch(
@@ -663,12 +723,15 @@ pub fn tail(path: &Path, from: u64, n: usize) -> Vec<String> {
     lines[lines.len().saturating_sub(n)..].to_vec()
 }
 
+/// Settles a run once its goose has exited. `hook_session`: goose-triggers' hooks recorded
+/// the run's goose session, which shows goose loaded its plugin.
 fn finish(
     store: &Store,
     run: &Run,
     mode: &Mode,
     wd: &Path,
     stderr: &[String],
+    hook_session: bool,
     w: Watched,
 ) -> Result<()> {
     let cur = store.run(run.id)?.context("the run left the store")?;
@@ -724,7 +787,7 @@ fn finish(
                 .unwrap_or_default()
         ));
     }
-    if cur.session_id.is_none() {
+    if !hook_session {
         return fail(&format!(
             "goose did not run goose-triggers' plugin hooks (no session was recorded); check that goose loads plugins from {}",
             wd.join(".agents/plugins").display()
@@ -988,6 +1051,40 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_session_is_picked_by_name_folder_and_time() {
+        // As goose 1.57.0's `goose session list --format json` gives them (fields cut).
+        let list = json!([
+            {"id": "20261106_9", "name": "goose-triggers form run 3", "working_dir": "/w/form", "created_at": "2026-11-06T09:55:50Z"},
+            {"id": "20261106_8", "name": "goose-triggers form run 3", "working_dir": "/w/other", "created_at": "2026-11-06T09:55:49Z"},
+            {"id": "20261106_7", "name": "goose-triggers form run 3", "working_dir": "/w/form", "created_at": "2026-11-06T09:55:44Z"},
+            {"id": "20261106_6", "name": "goose-triggers form run 31", "working_dir": "/w/form", "created_at": "2026-11-06T09:55:59Z"},
+            {"id": "20261101_1", "name": "goose-triggers form run 3", "working_dir": "/w/form", "created_at": "2026-11-01T08:00:00Z"}
+        ]);
+        let at = |t: &str| chrono::DateTime::parse_from_rfc3339(t).unwrap().timestamp();
+        let wd = Path::new("/w/form");
+        let name = "goose-triggers form run 3";
+        assert_eq!(
+            pick_session(&list, name, wd, at("2026-11-06T09:55:44Z")).as_deref(),
+            Some("20261106_9")
+        );
+        assert_eq!(
+            pick_session(&list, name, wd, at("2026-11-06T09:55:51Z")),
+            None
+        );
+        // An older session of the same name (an earlier state folder's run 3) is not taken.
+        assert_eq!(
+            pick_session(
+                &json!([list[4].clone()]),
+                name,
+                wd,
+                at("2026-11-06T09:00:00Z")
+            ),
+            None
+        );
+        assert_eq!(pick_session(&json!("no list"), name, wd, 0), None);
     }
 
     #[test]

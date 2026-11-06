@@ -64,7 +64,7 @@ pub fn handle(
     queue: &mut Queue,
 ) -> Reply {
     let path = url.split('?').next().unwrap_or("");
-    if method == "GET" && path == "/health" {
+    if (method == "GET" || method == "HEAD") && path == "/health" {
         return reply(200, json!({"ok": true}));
     }
     let Some(name) = path.strip_prefix("/hooks/") else {
@@ -86,12 +86,18 @@ pub fn handle(
         return reply(401, json!({"error": "missing or wrong shared secret"}));
     }
     let mut buf = Vec::new();
-    if body
-        .take(MAX_BODY as u64 + 1)
-        .read_to_end(&mut buf)
-        .is_err()
-    {
-        return reply(400, json!({"error": "could not read the body"}));
+    if let Err(e) = body.take(MAX_BODY as u64 + 1).read_to_end(&mut buf) {
+        return if matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            reply(
+                408,
+                json!({"error": "the request did not arrive whole in time"}),
+            )
+        } else {
+            reply(400, json!({"error": "could not read the body"}))
+        };
     }
     if buf.len() > MAX_BODY {
         return reply(413, json!({"error": "body over 64 KiB"}));
@@ -113,8 +119,9 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// The request line and headers may take at most this much.
 const MAX_HEAD: usize = 16 << 10;
 
-/// Writes a reply and closes the connection, without reading what the client still sends.
-fn respond(mut stream: &TcpStream, r: Reply) {
+/// Writes a reply (only its head when `head_only`, the answer to a HEAD request) and closes
+/// the connection, without reading what the client still sends.
+fn respond(mut stream: &TcpStream, r: Reply, head_only: bool) {
     let reason = match r.status {
         200 => "OK",
         202 => "Accepted",
@@ -132,9 +139,10 @@ fn respond(mut stream: &TcpStream, r: Reply) {
     let body = r.body.to_string();
     let _ = write!(
         stream,
-        "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         r.status,
-        body.len()
+        body.len(),
+        if head_only { "" } else { body.as_str() }
     );
     let _ = stream.flush();
     // Closing with unread request bytes would reset the connection before the client reads
@@ -149,6 +157,33 @@ fn respond(mut stream: &TcpStream, r: Reply) {
             Ok(0) | Err(_) => break,
             Ok(n) => taken += n,
         }
+    }
+}
+
+/// The body a request announced: reading it fails if the connection ends before all of it
+/// came.
+struct Announced<R> {
+    inner: R,
+    left: u64,
+}
+
+impl<R: Read> Read for Announced<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let max = buf
+            .len()
+            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..max])?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the body ended before its Content-Length",
+            ));
+        }
+        self.left -= n as u64;
+        Ok(n)
     }
 }
 
@@ -219,13 +254,14 @@ fn read_head(reader: &mut BufReader<Deadline>) -> std::result::Result<Head, u16>
     Ok((method, target, headers))
 }
 
-/// One connection, one request, on a thread of its own: reads time out, and a body is read
-/// only after the rule and the secret are checked, and only as far as its 64 KiB cap.
-fn serve_one(cfg: &Config, secret: &str, stream: TcpStream) {
+/// One connection, one request, on a thread of its own: the whole request must arrive
+/// within `deadline`, and a body is read only after the rule and the secret are checked, and
+/// only as far as its 64 KiB cap.
+fn serve_one(cfg: &Config, secret: &str, stream: TcpStream, deadline: Duration) {
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let mut reader = BufReader::new(Deadline {
         stream: &stream,
-        until: std::time::Instant::now() + IO_TIMEOUT,
+        until: std::time::Instant::now() + deadline,
     });
     let (method, target, headers) = match read_head(&mut reader) {
         Ok(h) => h,
@@ -233,6 +269,7 @@ fn serve_one(cfg: &Config, secret: &str, stream: TcpStream) {
             respond(
                 &stream,
                 reply(status, json!({"error": "could not read the request"})),
+                false,
             );
             return;
         }
@@ -251,6 +288,7 @@ fn serve_one(cfg: &Config, secret: &str, stream: TcpStream) {
                     411,
                     json!({"error": "send a Content-Length, not a chunked body"}),
                 ),
+                false,
             );
             return;
         }
@@ -258,7 +296,11 @@ fn serve_one(cfg: &Config, secret: &str, stream: TcpStream) {
         (None, Some(v)) => match v.parse::<u64>() {
             Ok(n) => n,
             Err(_) => {
-                respond(&stream, reply(400, json!({"error": "bad Content-Length"})));
+                respond(
+                    &stream,
+                    reply(400, json!({"error": "bad Content-Length"})),
+                    false,
+                );
                 return;
             }
         },
@@ -273,11 +315,18 @@ fn serve_one(cfg: &Config, secret: &str, stream: TcpStream) {
     {
         let _ = (&stream).write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
     }
-    let mut body = reader.take(length.min(MAX_BODY as u64 + 1));
+    let mut body = Announced {
+        inner: reader,
+        left: length.min(MAX_BODY as u64 + 1),
+    };
     let store = match Store::open(&cfg.db_path()) {
         Ok(s) => s,
         Err(e) => {
-            respond(&stream, reply(500, json!({"error": format!("{e:#}")})));
+            respond(
+                &stream,
+                reply(500, json!({"error": format!("{e:#}")})),
+                false,
+            );
             return;
         }
     };
@@ -303,7 +352,7 @@ fn serve_one(cfg: &Config, secret: &str, stream: TcpStream) {
             "webhook {target}: refused, wrong or missing secret"
         ));
     }
-    respond(&stream, r);
+    respond(&stream, r, method == "HEAD");
 }
 
 /// Counts a request while it is served, however its thread ends.
@@ -353,9 +402,13 @@ pub fn serve(cfg: Arc<Config>, stop: &'static AtomicBool) -> Result<Option<JoinH
                 let _guard = guard;
                 if full {
                     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-                    respond(&stream, reply(503, json!({"error": "busy, try again"})));
+                    respond(
+                        &stream,
+                        reply(503, json!({"error": "busy, try again"})),
+                        false,
+                    );
                 } else {
-                    serve_one(&cfg, &secret, stream);
+                    serve_one(&cfg, &secret, stream, IO_TIMEOUT);
                 }
             });
         }
@@ -368,10 +421,13 @@ mod tests {
     use super::*;
 
     fn cfg() -> Config {
+        // A folder (and store) of its own for each test, as they run at once.
+        static N: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "gt-webhook-{}-{}",
+            "gt-webhook-{}-{}-{}",
             std::process::id(),
-            crate::util::now()
+            crate::util::now(),
+            N.fetch_add(1, Ordering::SeqCst)
         ));
         std::fs::create_dir_all(dir.join("in")).unwrap();
         std::fs::write(dir.join("r.yaml"), "title: t\n").unwrap();
@@ -421,22 +477,32 @@ mod tests {
         assert_eq!(call(&c, "POST", "/hooks/form", ok, &big), (413, 0));
     }
 
-    /// Sends raw bytes to serve_one and returns the reply's status line, without the client
-    /// ever sending the body it announced.
-    fn exchange(c: &Config, request: &str) -> String {
+    /// Sends raw bytes to serve_one, which gives the request `deadline` to arrive, and
+    /// returns the whole reply. With `close`, the client then stops sending (the connection's
+    /// write side ends); else it sends nothing more but keeps the connection open.
+    fn exchange_with(c: &Config, request: &str, deadline: Duration, close: bool) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(addr).unwrap();
         let (server, _) = listener.accept().unwrap();
         let c = c.clone();
-        let t = std::thread::spawn(move || serve_one(&c, "0123456789abcdef", server));
+        let t = std::thread::spawn(move || serve_one(&c, "0123456789abcdef", server, deadline));
         client.write_all(request.as_bytes()).unwrap();
+        if close {
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+        }
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         let mut out = String::new();
         let _ = client.read_to_string(&mut out);
         t.join().unwrap();
+        out
+    }
+
+    /// The reply's status line, the client never sending the body it announced.
+    fn exchange(c: &Config, request: &str) -> String {
+        let out = exchange_with(c, request, IO_TIMEOUT, false);
         out.lines().next().unwrap_or("").to_string()
     }
 
@@ -451,6 +517,39 @@ mod tests {
         let chunked = "POST /hooks/form HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
         assert_eq!(exchange(&c, chunked), "HTTP/1.1 411 Length Required");
         assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_body_that_stalls_gets_408_and_one_cut_short_400() {
+        let c = cfg();
+        let head = "POST /hooks/form HTTP/1.1\r\nAuthorization: Bearer 0123456789abcdef\r\nContent-Length: 20\r\n\r\n{\"name\":";
+        let first = |out: String| out.lines().next().unwrap_or("").to_string();
+        let start = std::time::Instant::now();
+        let stalled = exchange_with(&c, head, Duration::from_millis(500), false);
+        assert_eq!(first(stalled), "HTTP/1.1 408 Request Timeout");
+        assert!(start.elapsed() < Duration::from_secs(3));
+        let cut = exchange_with(&c, head, Duration::from_secs(5), true);
+        assert_eq!(first(cut), "HTTP/1.1 400 Bad Request");
+        // Headers that stall are 408 too.
+        let partial = "POST /hooks/form HTTP/1.1\r\nContent-Le";
+        let out = exchange_with(&c, partial, Duration::from_millis(500), false);
+        assert_eq!(first(out), "HTTP/1.1 408 Request Timeout");
+    }
+
+    #[test]
+    fn health_answers_get_and_head() {
+        let c = cfg();
+        let get = exchange_with(&c, "GET /health HTTP/1.1\r\n\r\n", IO_TIMEOUT, true);
+        assert!(
+            get.starts_with("HTTP/1.1 200 OK") && get.ends_with(r#"{"ok":true}"#),
+            "{get}"
+        );
+        let head = exchange_with(&c, "HEAD /health HTTP/1.1\r\n\r\n", IO_TIMEOUT, true);
+        assert!(
+            head.starts_with("HTTP/1.1 200 OK") && head.ends_with("\r\n\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("Content-Length: 11\r\n"), "{head}");
     }
 
     #[test]

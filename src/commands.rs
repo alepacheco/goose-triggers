@@ -54,12 +54,17 @@ pub fn status(cfg: &Config, all: bool) -> Result<()> {
                 Some(c) => format!("waits on: {} {}", c.tool_name, call_line(&c.tool_input, 80)),
                 None => "held".into(),
             },
+            // `log <run>` is named once, below the table.
             state::FAILED => r
                 .error
                 .as_deref()
+                .map(|e| e.trim_end_matches(&format!("; see goose-triggers log {}", r.id)))
                 .map(|e| short(e, 100))
                 .unwrap_or_default(),
-            state::APPROVED => "approved: resumes when `goose-triggers run` picks it up".into(),
+            state::APPROVED => format!(
+                "approved: resumes when `goose-triggers run` picks it up (`reject {}` withdraws it)",
+                r.id
+            ),
             _ => String::new(),
         };
         println!(
@@ -77,6 +82,8 @@ pub fn status(cfg: &Config, all: bool) -> Result<()> {
         println!(
             "\n{held} run(s) held. Read a held call in full with goose-triggers log <RUN>, then: goose-triggers approve <RUN> | goose-triggers reject <RUN>"
         );
+    } else {
+        println!("\nA run in full: goose-triggers log <RUN>");
     }
     if !crate::daemon::is_running(&cfg.state_dir) {
         println!(
@@ -257,7 +264,10 @@ pub fn approve(cfg: &Config, run: i64, yes: bool) -> Result<()> {
     println!("{}", indent(&full_call(&shown.tool_input), "  "));
     // SAFETY: isatty only inspects a file descriptor.
     let interactive = unsafe { libc::isatty(0) } == 1;
-    if interactive && !yes {
+    if !interactive && !yes {
+        bail!("not approved: there is no terminal to ask on; pass --yes to approve run {run} without being asked");
+    }
+    if !yes {
         print!("Approve this call? [y/N] ");
         std::io::Write::flush(&mut std::io::stdout())?;
         let mut answer = String::new();
@@ -281,8 +291,13 @@ pub fn reject(cfg: &Config, run: i64) -> Result<()> {
     refuse_inside_a_run()?;
     let store = open(cfg)?;
     let call = store.reject(run)?;
+    let what = if call.state == "approved" {
+        "withdrew the approval of"
+    } else {
+        "rejected"
+    };
     println!(
-        "run {run}: rejected {} {}; the run has ended",
+        "run {run}: {what} {} {}; the run has ended",
         clean(&call.tool_name),
         call_line(&call.tool_input, 200)
     );
