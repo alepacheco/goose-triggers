@@ -358,7 +358,23 @@ impl Harness {
                 call.tool_input
             ),
         )?;
-        let tl = self.store()?.timeline(folder_run)?;
+        // The run is held as soon as the hook denies the call; goose-triggers then stops goose
+        // and logs it, a moment later: wait for that line (at most 10 s).
+        let tl = wait_for(
+            "goose to be stopped at the hold",
+            Duration::from_secs(10),
+            || {
+                let tl = self.store()?.timeline(folder_run)?;
+                Ok(tl
+                    .iter()
+                    .any(|l| {
+                        l.what
+                            .starts_with("goose-triggers stopped goose at the hold")
+                    })
+                    .then_some(tl))
+            },
+        )
+        .unwrap_or_default();
         let held_at = tl
             .iter()
             .find(|l| l.what.starts_with("held:"))
