@@ -306,6 +306,28 @@ pub fn respond(req: &Value, call_seq: u64, script: Script) -> (String, String) {
 pub struct Server {
     pub addr: SocketAddr,
     stop: Arc<AtomicBool>,
+    offered: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+}
+
+impl Server {
+    /// The names of the tools goose offered the model, in any request so far.
+    pub fn tools_offered(&self) -> Vec<String> {
+        self.offered
+            .lock()
+            .map(|t| t.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// The names of the tools a chat-completions request offers.
+pub fn tool_names(req: &Value) -> Vec<String> {
+    req.get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
 }
 
 impl Drop for Server {
@@ -324,6 +346,8 @@ pub fn start(deny_delay: Duration, script: Script) -> Result<Server> {
         .ok_or_else(|| anyhow!("scripted model server has no IP address"))?;
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
+    let offered = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let offered2 = offered.clone();
     std::thread::spawn(move || {
         let mut seq = 0u64;
         while !stop2.load(Ordering::SeqCst) {
@@ -332,6 +356,7 @@ pub fn start(deny_delay: Duration, script: Script) -> Result<Server> {
             };
             seq += 1;
             let call_seq = seq;
+            let offered = offered2.clone();
             std::thread::spawn(move || {
                 let mut body = String::new();
                 let _ = req.as_reader().read_to_string(&mut body);
@@ -341,6 +366,9 @@ pub fn start(deny_delay: Duration, script: Script) -> Result<Server> {
                 } else {
                     match serde_json::from_str::<Value>(&body) {
                         Ok(v) => {
+                            if let Ok(mut o) = offered.lock() {
+                                o.extend(tool_names(&v));
+                            }
                             if answer(&v, script).1 {
                                 std::thread::sleep(deny_delay);
                             }
@@ -364,7 +392,11 @@ pub fn start(deny_delay: Duration, script: Script) -> Result<Server> {
             });
         }
     });
-    Ok(Server { addr, stop })
+    Ok(Server {
+        addr,
+        stop,
+        offered,
+    })
 }
 
 #[cfg(test)]
@@ -475,6 +507,13 @@ mod tests {
         msgs.push(call("c4", "write", &json!({"content": "x", "path": "/p"})));
         msgs.push(json!({"role": "tool", "tool_call_id": "c4", "content": "written"}));
         assert_eq!(ask(&msgs).0, Answer::Text(DONE_TEXT.into()));
+    }
+
+    #[test]
+    fn reads_the_tools_offered() {
+        let r = json!({"tools": [{"type": "function", "function": {"name": "shell"}}, {"type": "function", "function": {"name": "tree"}}]});
+        assert_eq!(tool_names(&r), ["shell", "tree"]);
+        assert!(tool_names(&json!({})).is_empty());
     }
 
     #[test]

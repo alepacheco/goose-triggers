@@ -265,6 +265,7 @@ pub fn run(cfg: Config) -> Result<()> {
     let goose = crate::util::goose_version(
         &cfg.goose,
         &[],
+        cfg.webhook.as_ref().and_then(|w| w.secret_env.as_deref()),
         "set `goose:` in the config to the goose binary",
     )?;
     for rule in &cfg.rules {

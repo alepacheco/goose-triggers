@@ -732,6 +732,7 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
     let version = match crate::util::goose_version(
         &goose,
         &[("GOOSE_PATH_ROOT", root.as_path())],
+        None,
         "pass --goose <path>",
     ) {
         Ok(v) => v,

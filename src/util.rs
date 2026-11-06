@@ -217,13 +217,22 @@ pub fn output_within(
     }))
 }
 
-/// `goose --version`: checks that the goose binary runs, and says which goose it is. `hint`
+/// `goose --version`: checks that the goose binary runs, and says which goose it is, with
+/// `env` set and `hide` (the webhook secret's variable) removed from its environment. `hint`
 /// says how to point goose-triggers at another goose.
-pub fn goose_version(goose: &str, env: &[(&str, &Path)], hint: &str) -> anyhow::Result<String> {
+pub fn goose_version(
+    goose: &str,
+    env: &[(&str, &Path)],
+    hide: Option<&str>,
+    hint: &str,
+) -> anyhow::Result<String> {
     let mut cmd = std::process::Command::new(goose);
     cmd.arg("--version");
     for (k, v) in env {
         cmd.env(k, v);
+    }
+    if let Some(var) = hide {
+        cmd.env_remove(var);
     }
     let out = match output_within(&mut cmd, std::time::Duration::from_secs(60)) {
         Ok(Some(out)) => out,
@@ -245,15 +254,20 @@ mod tests {
 
     #[test]
     fn a_missing_goose_is_named_with_the_hint() {
-        let e = goose_version("/nonexistent/goose", &[], "set `goose:` in the config")
-            .unwrap_err()
-            .to_string();
+        let e = goose_version(
+            "/nonexistent/goose",
+            &[],
+            None,
+            "set `goose:` in the config",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             e.contains("/nonexistent/goose") && e.contains("set `goose:` in the config"),
             "{e}"
         );
         // A command that runs but is not goose (it fails on --version) is refused too.
-        let e = goose_version("false", &[], "set `goose:`")
+        let e = goose_version("false", &[], None, "set `goose:`")
             .unwrap_err()
             .to_string();
         assert!(e.contains("`false --version` failed"), "{e}");
