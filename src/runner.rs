@@ -116,12 +116,11 @@ pub fn goose_default_provider() -> Option<String> {
     {
         return Some(p);
     }
-    // goose reads ACTIVE_PROVIDER as JSON first (a quoted name), then as text.
-    if let Ok(p) = std::env::var("ACTIVE_PROVIDER") {
-        let p = serde_json::from_str::<String>(&p).unwrap_or_else(|_| p.trim().to_string());
-        if !p.is_empty() {
-            return Some(p);
-        }
+    if let Some(p) = std::env::var("ACTIVE_PROVIDER")
+        .ok()
+        .and_then(|v| active_provider_env(&v))
+    {
+        return Some(p);
     }
     let mut files = vec![PathBuf::from("/etc/goose/config.yaml")];
     if let Some(list) = std::env::var_os("GOOSE_ADDITIONAL_CONFIG_FILES") {
@@ -133,6 +132,21 @@ pub fn goose_default_provider() -> Option<String> {
         .filter_map(|f| std::fs::read_to_string(f).ok())
         .collect();
     provider_in_goose_configs(&layers)
+}
+
+/// The provider an `ACTIVE_PROVIDER` value names, read as goose 1.57.0 reads it
+/// (`parse_env_value`): JSON first, then `true`, `false` or a number, else the text. A value
+/// that is not a name (a number, a boolean, null) is passed over, as goose passes over it.
+fn active_provider_env(v: &str) -> Option<String> {
+    let t = v.trim();
+    let name = match serde_json::from_str::<serde_json::Value>(v) {
+        Ok(serde_json::Value::String(s)) => Some(s),
+        Ok(_) => None,
+        Err(_) if ["true", "false"].contains(&t.to_lowercase().as_str()) => None,
+        Err(_) if t.parse::<f64>().is_ok() => None,
+        Err(_) => Some(v.to_string()),
+    };
+    name.filter(|n| !n.is_empty())
 }
 
 /// The provider goose's config files (their texts, in goose's order) set, read as goose 1.57.0
@@ -874,6 +888,21 @@ mod tests {
         );
         assert_eq!(one("GOOSE_MODEL: x\n"), None);
         assert_eq!(one(": not yaml ["), None);
+    }
+
+    #[test]
+    fn reads_active_provider_as_goose_does() {
+        assert_eq!(
+            active_provider_env("claude-code").as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(
+            active_provider_env("\"claude-code\"").as_deref(),
+            Some("claude-code")
+        );
+        for v in ["1", "true", "null", "2.5", "", "\"\""] {
+            assert_eq!(active_provider_env(v), None, "{v}");
+        }
     }
 
     #[test]

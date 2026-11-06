@@ -646,6 +646,8 @@ struct Lexed {
     active: Vec<String>,
     /// The words (by their place in `toks`) that hold a substitution or a variable.
     subbed: Vec<usize>,
+    /// A quote is still open at the end.
+    open_quote: bool,
 }
 
 impl Lexed {
@@ -888,6 +890,7 @@ fn lex(cmd: &str) -> Lexed {
         }
     }
     x.end_word();
+    x.l.open_quote = quote.is_some();
     x.l
 }
 
@@ -1004,15 +1007,15 @@ fn simple_commands(l: &Lexed) -> Option<Vec<Simple>> {
 
 /// Whether a command substitution only prints the date: `date`, with a format or a plain
 /// option (never `-s`, which sets the clock), and nothing bash would read otherwise than as
-/// plain words or quoted text: no escape, comment, parenthesis, brace or line break, so bash
-/// too ends the substitution at its first `)`.
+/// plain words or quoted text of one kind of quote, every quote closed: no escape, comment,
+/// parenthesis, brace or line break, so bash too ends the substitution at its first `)`.
 fn is_date(text: &str) -> bool {
     let l = lex(text);
     let words: Vec<&str> = l.texts().collect();
     text.chars()
         .all(|ch| ch.is_ascii_alphanumeric() || " \t+%-:_./,'\"".contains(ch))
-        && text.matches('\'').count() % 2 == 0
-        && text.matches('"').count() % 2 == 0
+        && !(text.contains('\'') && text.contains('"'))
+        && !l.open_quote
         && l.active.is_empty()
         && l.toks.iter().all(|t| matches!(t, Tok::Word(_)))
         && words.first() == Some(&"date")
@@ -2979,6 +2982,9 @@ mod tests {
             "echo \"${ date +%F } ; rm -f x ; }\" >> entries.csv",
             "if true; then rm x; fi",
             "cat entries.csv 2>&3",
+            // Two kinds of quote: bash and the lexer end the substitution in different places.
+            "echo \"$(date \"+%F'\")'; touch ran; echo '\")\" >> entries.csv",
+            "echo \"$(date '+%F\"')\"; touch ran; echo \"'\")\" >> entries.csv",
             // A substitution as the program, an option or a file.
             "$(date +%F) entries.csv",
             "echo x >> \"$(date +%F).csv\"",
