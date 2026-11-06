@@ -64,7 +64,7 @@ The selftest runs the whole path with your goose binary and a scripted model ser
 6. `approve` on the second run resumes it, its model makes a different call, which is held again; `reject` ends the run, and no held call ran;
 7. a webhook event whose value carries YAML that would add a command to the recipe is refused before goose runs anything;
 8. a run that goose fails (its rule names a provider goose does not have) is marked failed with goose's own reason, and none of the event's values in it;
-9. an event whose value breaks the recipe's YAML, and one that lacks the recipe's parameter, fail before goose runs, with reasons that quote none of the sender's text.
+9. an event whose value breaks the recipe's YAML, and one that lacks the recipe's parameter, fail before goose runs, with reasons that quote none of the sender's text; one whose value goose cannot be given (a NUL byte) fails with goose-triggers' own reason.
 
 Pass `--goose <path>` to test another goose binary, `--keep` to keep the temporary folder.
 

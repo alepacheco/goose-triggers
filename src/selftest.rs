@@ -520,9 +520,14 @@ impl Selftest {
             })?;
             refused.push((run, r.state, r.session_id, r.error.unwrap_or_default()));
         }
+        // goose's own error, which quotes the value, is in the log beside the event.
         let goose_error_logged = self
             .cli(&["log", &refused[0].0.to_string()])?
-            .contains("goose's error rendering the recipe with the event's values");
+            .lines()
+            .any(|l| {
+                l.contains("goose's error rendering the recipe with the event's values")
+                    && l.contains(chosen)
+            });
         self.check(
             refused.iter().all(|(_, st, sid, e)| {
                 st == state::FAILED && sid.is_none() && !e.is_empty() && !e.contains(chosen)
@@ -535,10 +540,48 @@ impl Selftest {
             ),
         )?;
 
+        // A value goose cannot be given (a NUL byte, refused before goose starts) fails with
+        // goose-triggers' own reason, not as a value that breaks the recipe.
+        let (st, reply) = http(
+            &self.listen,
+            "POST",
+            &format!("/hooks/{WEBHOOK_RULE}"),
+            Some(&secret),
+            &json!({ "order": "A-10\u{0}B" }).to_string(),
+        )?;
+        let nul_run = serde_json::from_str::<serde_json::Value>(&reply)
+            .ok()
+            .and_then(|v| v["run"].as_i64())
+            .filter(|_| st == 202)
+            .with_context(|| format!("webhook answered {st} {reply}"))?;
+        let r = wait_for("the NUL-byte event's run to fail", WAIT, || {
+            let r = self.store()?.run(nul_run)?.context("run gone")?;
+            Ok(
+                ([state::FAILED, state::DONE, state::HELD].contains(&r.state.as_str())
+                    && r.pid.is_none())
+                .then_some(r),
+            )
+        })?;
+        let error = r.error.unwrap_or_default();
+        self.check(
+            r.state == state::FAILED
+                && r.session_id.is_none()
+                && error.contains("could not render the recipe with the event's values")
+                && error.contains("nul byte")
+                && !error.contains("breaks it"),
+            &format!(
+                "run {nul_run}: an event value goose cannot be given (a NUL byte) failed before goose ran, with goose-triggers' own reason: {}",
+                crate::util::short(&error, 160)
+            ),
+        )?;
+
         let log = self.cli(&["log", &folder_run.to_string()])?;
         self.check(
-            log.contains("approved call made") && log.contains(DONE_TEXT),
-            "goose-triggers log shows the run's story",
+            log.contains("approved call made")
+                && log.contains(DONE_TEXT)
+                && log.contains("goose's stderr, last lines")
+                && log.contains("Headless run interrupted"),
+            "goose-triggers log shows the run's story, goose's stderr included (goose stopped at the hold)",
         )?;
         self.stop_daemon()?;
         self.ok("goose-triggers run stopped");
