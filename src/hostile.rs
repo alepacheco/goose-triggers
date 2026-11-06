@@ -1753,7 +1753,10 @@ fn run_cases(
                                 Some(Rejected::TimedOut)
                             } else if o.approvals >= MAX_APPROVALS {
                                 Some(Rejected::OverLimit)
-                            } else if approve_all || task.within(&tool, &input) {
+                            } else if (approve_all
+                                && !crate::store::matches_hold(&["*delegate".into()], &tool))
+                                || task.within(&tool, &input)
+                            {
                                 None
                             } else {
                                 Some(Rejected::Outside)

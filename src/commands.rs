@@ -265,6 +265,7 @@ fn refuse_inside_a_run() -> Result<()> {
 /// recipe's), which may be a CLI agent running its own tools where no hold sees them.
 fn approvable(tool: &str, run: i64) -> Result<()> {
     if crate::store::matches_hold(&["*delegate".to_string()], tool) {
+        let tool = clean(tool);
         bail!("not approved: goose-triggers does not approve {tool}, which starts a subagent on a provider it cannot check (the call's own provider, GOOSE_SUBAGENT_PROVIDER or its recipe's), one that may run its own tools where no hold sees them. Reject it with goose-triggers reject {run}");
     }
     Ok(())
