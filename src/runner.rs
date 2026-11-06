@@ -128,21 +128,18 @@ pub fn goose_default_provider() -> Option<String> {
 }
 
 /// The provider goose's config files (their texts, in goose's order) set, read as goose 1.57.0
-/// reads its merged config: with a `providers` block, `active_provider` (else the old
-/// `GOOSE_PROVIDER` key); without one, goose moves `GOOSE_PROVIDER` to `active_provider`.
+/// reads them for a run (`get_active_provider`): `active_provider`, else `GOOSE_PROVIDER`, each
+/// from the last file that sets it.
 fn provider_in_goose_configs(layers: &[String]) -> Option<String> {
     let docs: Vec<serde_yaml_ng::Value> = layers
         .iter()
         .filter_map(|t| serde_yaml_ng::from_str(t).ok())
         .collect();
-    // A top-level key of the merged config: the last file's that sets it.
-    let last = |k: &str| docs.iter().rev().find_map(|v| v.get(k));
-    let text = |k: &str| last(k).and_then(|p| p.as_str()).map(str::to_string);
-    if last("providers").is_some() {
-        text("active_provider").or_else(|| text("GOOSE_PROVIDER"))
-    } else {
-        text("GOOSE_PROVIDER").or_else(|| text("active_provider"))
-    }
+    ["active_provider", "GOOSE_PROVIDER"].iter().find_map(|k| {
+        docs.iter()
+            .rev()
+            .find_map(|v| v.get(*k).and_then(|p| p.as_str()).map(str::to_string))
+    })
 }
 
 fn check_provider(run: &Run) -> Result<()> {
@@ -864,7 +861,7 @@ mod tests {
             Some("claude-code")
         );
         assert_eq!(
-            one("active_provider: ollama\nproviders:\n  ollama: {enabled: true}\nGOOSE_PROVIDER: openai\n").as_deref(),
+            one("active_provider: ollama\nGOOSE_PROVIDER: openai\n").as_deref(),
             Some("ollama")
         );
         assert_eq!(one("GOOSE_MODEL: x\n"), None);
@@ -876,6 +873,7 @@ mod tests {
         let layers = |ts: &[&str]| {
             provider_in_goose_configs(&ts.iter().map(|t| t.to_string()).collect::<Vec<_>>())
         };
+        let one_file = |t: &str| layers(&[t]);
         // The system-wide file sets a CLI-agent provider and the user's file none: it is used.
         assert_eq!(
             layers(&["active_provider: claude-acp\n", "GOOSE_MODEL: x\n"]).as_deref(),
@@ -886,19 +884,23 @@ mod tests {
             layers(&["active_provider: claude-acp\n", "active_provider: ollama\n"]).as_deref(),
             Some("ollama")
         );
-        // With a providers block, active_provider comes before the old GOOSE_PROVIDER key;
-        // without one, goose moves GOOSE_PROVIDER to active_provider.
+        // active_provider in any file comes before GOOSE_PROVIDER in a later one, as goose
+        // reads them for a run (it moves GOOSE_PROVIDER only when it writes the user's file).
         assert_eq!(
             layers(&[
-                "active_provider: openai\nproviders: {}\n",
-                "GOOSE_PROVIDER: claude-code\n"
+                "active_provider: claude-acp\n",
+                "GOOSE_PROVIDER: openai\nGOOSE_MODEL: gpt-4o\n"
             ])
             .as_deref(),
-            Some("openai")
+            Some("claude-acp")
         );
         assert_eq!(
             layers(&["active_provider: openai\n", "GOOSE_PROVIDER: claude-code\n"]).as_deref(),
-            Some("claude-code")
+            Some("openai")
+        );
+        assert_eq!(
+            one_file("GOOSE_PROVIDER: openai\nactive_provider: claude-acp\n").as_deref(),
+            Some("claude-acp")
         );
         assert_eq!(layers(&[]), None);
     }

@@ -865,6 +865,7 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
         "pass --goose <path>",
     ) {
         Ok(v) => v,
+        Err(_) if interrupted() => finish_interrupted(&dir, keep),
         Err(e) => {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(e);
