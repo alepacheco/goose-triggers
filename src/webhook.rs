@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -105,6 +105,54 @@ pub fn handle(
 }
 
 /// Starts the listener; it serves until `stop` is set.
+/// At most this many requests are handled at once; more get 503.
+const MAX_REQUESTS: usize = 16;
+
+fn respond(req: tiny_http::Request, r: Reply) {
+    let header =
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let response = tiny_http::Response::from_string(r.body.to_string())
+        .with_status_code(r.status)
+        .with_header(header);
+    let _ = req.respond(response);
+}
+
+/// One request, on a thread of its own so a slow client holds up no one else.
+fn serve_one(cfg: &Config, secret: &str, mut req: tiny_http::Request) {
+    let method = req.method().as_str().to_string();
+    let url = req.url().to_string();
+    let auth = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Authorization"))
+        .map(|h| h.value.as_str().to_string());
+    let store = match Store::open(&cfg.db_path()) {
+        Ok(s) => s,
+        Err(e) => {
+            respond(req, reply(500, json!({"error": format!("{e:#}")})));
+            return;
+        }
+    };
+    let mut queue = |rule: &crate::config::Rule, fields: BTreeMap<String, String>| {
+        crate::daemon::queue_event(&store, rule, "webhook", &fields, None)?
+            .ok_or_else(|| anyhow!("the event was not stored"))
+    };
+    let r = handle(
+        cfg,
+        secret,
+        &method,
+        &url,
+        auth.as_deref(),
+        req.as_reader(),
+        &mut queue,
+    );
+    if r.status == 401 {
+        crate::daemon::say(&format!("webhook {url}: refused, wrong or missing secret"));
+    }
+    respond(req, r);
+}
+
+/// Starts the listener; it serves until `stop` is set.
 pub fn serve(cfg: Arc<Config>, stop: &'static AtomicBool) -> Result<Option<JoinHandle<()>>> {
     let Some(wh) = cfg.webhook.clone() else {
         return Ok(None);
@@ -118,16 +166,10 @@ pub fn serve(cfg: Arc<Config>, stop: &'static AtomicBool) -> Result<Option<JoinH
     }
     let server = tiny_http::Server::http(&wh.listen)
         .map_err(|e| anyhow!("webhook listener on {}: {e}", wh.listen))?;
+    let busy = Arc::new(AtomicUsize::new(0));
     let handle = std::thread::spawn(move || {
-        let store = match Store::open(&cfg.db_path()) {
-            Ok(s) => s,
-            Err(e) => {
-                crate::daemon::say(&format!("webhook listener stopped: {e:#}"));
-                return;
-            }
-        };
         while !stop.load(Ordering::SeqCst) {
-            let mut req = match server.recv_timeout(Duration::from_millis(300)) {
+            let req = match server.recv_timeout(Duration::from_millis(300)) {
                 Ok(Some(r)) => r,
                 Ok(None) => continue,
                 Err(e) => {
@@ -135,36 +177,16 @@ pub fn serve(cfg: Arc<Config>, stop: &'static AtomicBool) -> Result<Option<JoinH
                     continue;
                 }
             };
-            let method = req.method().as_str().to_string();
-            let url = req.url().to_string();
-            let auth = req
-                .headers()
-                .iter()
-                .find(|h| h.field.equiv("Authorization"))
-                .map(|h| h.value.as_str().to_string());
-            let mut queue = |rule: &crate::config::Rule, fields: BTreeMap<String, String>| {
-                crate::daemon::queue_event(&store, rule, "webhook", &fields, None)?
-                    .ok_or_else(|| anyhow!("the event was not stored"))
-            };
-            let r = handle(
-                &cfg,
-                &wh.secret,
-                &method,
-                &url,
-                auth.as_deref(),
-                req.as_reader(),
-                &mut queue,
-            );
-            if r.status == 401 {
-                crate::daemon::say(&format!("webhook {url}: refused, wrong or missing secret"));
+            if busy.fetch_add(1, Ordering::SeqCst) >= MAX_REQUESTS {
+                busy.fetch_sub(1, Ordering::SeqCst);
+                respond(req, reply(503, json!({"error": "busy, try again"})));
+                continue;
             }
-            let header =
-                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                    .unwrap();
-            let response = tiny_http::Response::from_string(r.body.to_string())
-                .with_status_code(r.status)
-                .with_header(header);
-            let _ = req.respond(response);
+            let (cfg, secret, busy) = (cfg.clone(), wh.secret.clone(), busy.clone());
+            std::thread::spawn(move || {
+                serve_one(&cfg, &secret, req);
+                busy.fetch_sub(1, Ordering::SeqCst);
+            });
         }
     });
     Ok(Some(handle))

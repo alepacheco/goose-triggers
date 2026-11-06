@@ -12,13 +12,13 @@ You mark the actions that need your approval (running a command, writing a file,
 
 - A **rule** names an event source (a folder and a file-name pattern, or a webhook), a goose **recipe**, and the tools to **hold**.
 - Each event becomes a **run**: `goose run --recipe <recipe> --params <field>=<value> ... --output-format stream-json`, headless, in the rule's working folder. The event's fields are passed as the recipe's parameters of the same names.
-- goose fills parameters into the recipe's text before it reads the recipe, so a value carrying YAML or JSON syntax could add to the recipe itself (an extension, a retry command) rather than fill in its text. Before a run whose values hold anything but letters, digits, spaces and `._-/@+=`, goose-triggers has goose render the recipe twice, with the event's values and with placeholders, and starts the run only if the two have the same structure.
+- goose fills parameters into the recipe's text before it reads the recipe, so a value carrying YAML or JSON syntax could add to the recipe itself (an extension, a retry command) rather than fill in its text. Before a run whose values hold anything but letters, digits, spaces and `._-/@+=`, goose-triggers has goose render the recipe twice, with the event's values and with placeholders, and starts the run only if the two have the same structure and the values fill in nothing but the recipe's text fields (`prompt`, `instructions`, `title`, `description`, `activities`, `author`). File parameters (`input_type: file`, whose file goose pastes into the recipe) are not filled from events.
 - goose-triggers writes its own goose plugin into each rule's working folder (`.agents/plugins/goose-triggers/`). goose loads it when the run starts there. Its `PreToolUse` hook calls `goose-triggers hook`, which allows the call, or holds it when the tool matches the rule's `hold` list. Its `SessionStart` hook records the run's goose session. The hook does nothing in goose sessions that goose-triggers did not start.
 - On a hold, the hook denies the call with a reason and stores it in goose-triggers' SQLite store; the run becomes `held`, every further call in it is denied, and goose-triggers stops goose as soon as goose has recorded the denial. It stops goose with SIGINT, as Ctrl-C would: goose cancels its turn, stops the commands it started and saves the session.
 - The hook records every call it sees. If goose runs a tool the hook never saw (goose did not load the plugin), goose-triggers stops the run and marks it failed.
 - `goose-triggers approve <run>` stores a one-time permission for that tool name and input (compared as JSON, key order aside). goose-triggers then runs `goose run --resume --session-id <session> --text "<the user approved this call ...>"`. When goose makes that exact call again, the hook lets it through once. A different held call stops the run again for a new decision.
 - `goose-triggers reject <run>` ends the run; the held call never runs.
-- goose runs with `GOOSE_MODE=auto`: goose's own confirmations do not apply to headless runs, so the hold is the gate.
+- goose runs with `GOOSE_MODE=auto`. In a headless run goose answers its own confirmation requests itself, allowing the call (tools you set to "ask before" in goose included), so the hold is the only gate.
 
 Run states: `queued`, `running`, `held`, `approved` (waiting to resume), `done`, `failed`, `rejected`.
 
@@ -134,11 +134,11 @@ Pass `--goose <path>` to test another goose binary, `--keep` to keep the tempora
 
 Relative paths are relative to the config file; `~/` is your home folder.
 
-**A hold covers only the tools it names.** A run that may run commands or write files can do through them what a held tool would do: hold `shell`, `write` and `edit` whenever you hold anything (goose-triggers warns at start when a rule does not), plus every extension tool that sends or deletes things, or hold `*`. A rule that holds anything also holds goose's code mode (`execute_javascript`, which calls tools out of the hook's sight) and its extension manager (`manage_extensions`, which turns on extensions mid-run). goose-triggers refuses to run a rule with holds in a working folder that holds other goose plugins, whose hooks could run commands. A rule's holds are copied into each run when its event arrives.
+**A hold covers only the tools it names.** A run that may run commands or write files can do through them what a held tool would do: hold `shell`, `write` and `edit` whenever you hold anything (goose-triggers warns at start when a rule does not), plus every extension tool that sends or deletes things, or hold `*`. A rule that holds anything also holds goose's code mode (`execute_javascript`, which calls tools out of the hook's sight), its extension manager (`manage_extensions`, which turns on extensions mid-run) and `delegate` (which starts a subagent with a recipe's extensions). goose-triggers refuses to run a rule with holds in a working folder that holds other goose plugins, whose hooks could run commands. Plugins in your own `~/.agents/plugins` load in every goose session, goose-triggers' runs included: their hooks are yours to trust. A rule's holds are copied into each run when its event arrives.
 
 ### Event fields
 
-The fields an event gives; a recipe gets those it declares as parameters, by the same names. A run whose event lacks a parameter the recipe requires (no default) fails without starting goose, and says which.
+The fields an event gives; a recipe gets those it declares as parameters, by the same names. A run whose event lacks a parameter the recipe requires (no default) fails without starting goose, and says which. Declare parameters as strings (`input_type: string`): goose-triggers does not fill file parameters from events, as goose would paste the named file into the recipe; pass the path as a string and let the recipe read the file with its tools.
 
 - Folder events: `file_path` (the full path), `file_name`, `folder`.
 - Webhook events: each top-level field of a JSON object body (text as it is; numbers, booleans, arrays and objects as JSON text), and `body`, the whole body as text (unless the JSON has its own `body` field). The body may be up to 64 KiB.
@@ -152,7 +152,7 @@ The webhook answers `202 {"event": <id>, "run": <id>}`, `401` for a missing or w
 | `goose-triggers run` | watches the rules' sources and runs their recipes until stopped; one per state folder |
 | `goose-triggers status [--all]` | held runs, with the call each waits on in short, and the 20 latest others (`--all`: every run) |
 | `goose-triggers log [<run>]` | a run's event, its held calls in full, its timeline and goose's messages; with no run, the latest timeline of all runs |
-| `goose-triggers approve <run>` | approves the call a held run waits on, and prints it; `run` resumes the same session |
+| `goose-triggers approve <run> [--yes]` | shows the call a held run waits on and approves it (on a terminal it asks first, unless `--yes`); `run` resumes the same session |
 | `goose-triggers reject <run>` | rejects it; the run ends |
 | `goose-triggers selftest [--goose <path>] [--keep]` | the end-to-end check above |
 
@@ -180,6 +180,9 @@ cargo build --locked --release --target x86_64-unknown-linux-musl
 - You decide on holds from the command line; there are no notifications yet. The config is read when `goose-triggers run` starts.
 - The hold depends on goose loading goose-triggers' plugin from the working folder. Before each run, goose-triggers rewrites the plugin and checks goose's settings for a disabled one. If goose runs a tool the hook did not see, the run is stopped and marked failed, but that tool has already run.
 - A run stopped while it is going (goose-triggers stopped, or goose failed) is marked failed and not retried, except a resumed run that had not yet made its approved call: it resumes again.
+- goose is stopped with SIGINT. If it has not stopped 5 seconds later it gets SIGTERM and then SIGKILL, and a command it had started may then keep running.
+- Event values and approved calls go to goose on its command line, which other users of the machine can see in the process list.
+- A value that only fills in text is checked by its place in the recipe, not by what it says: a rule's recipe still reads event content, which may carry instructions for the model. That is what holds are for.
 - One approval lets one call through: once the run stops at another held call, an earlier unused approval lapses.
 
 ## License

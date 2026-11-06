@@ -106,11 +106,19 @@ pub fn clean(s: &str) -> String {
         match c {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&c.escape_unicode().to_string()),
+            c if c.is_control() || invisible(c) => out.push_str(&c.escape_unicode().to_string()),
             c => out.push(c),
         }
     }
     out
+}
+
+/// Characters that change how text around them shows without showing themselves:
+/// direction overrides and isolates, zero-width characters, the byte-order mark.
+fn invisible(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x061C | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064
+        | 0x2066..=0x206F | 0xFEFF)
 }
 
 /// Shortens a text to `max` characters for one-line displays, cleaned for the terminal.
@@ -188,6 +196,7 @@ mod tests {
     #[test]
     fn clean_escapes_control_characters() {
         assert_eq!(clean("a\u{1b}[2Jb\nc\td"), "a\\u{1b}[2Jb\\nc\\td");
+        assert_eq!(clean("rm \u{202e}fdp.exe"), "rm \\u{202e}fdp.exe");
         assert_eq!(short("abcdef", 4), "abc…");
     }
 

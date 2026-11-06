@@ -19,8 +19,8 @@ pub struct FolderWatch {
     pub folder: PathBuf,
     key: String,
     pattern: glob::Pattern,
-    /// Files seen in the last read and not yet taken: name -> (size, mtime in ns).
-    pending: HashMap<String, (u64, i128)>,
+    /// Files seen in the last read and not yet taken: name -> (size, mtime, ctime in ns).
+    pending: HashMap<String, (u64, i128, i128)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +29,8 @@ pub struct NewFile {
     pub path: PathBuf,
     pub size: u64,
     pub mtime: i128,
+    /// When the file's inode last changed (a copy that keeps the mtime still gets a new one).
+    pub ctime: i128,
 }
 
 impl NewFile {
@@ -43,10 +45,11 @@ impl NewFile {
 
     pub fn dedupe_key(&self, rule: &str) -> String {
         format!(
-            "folder:{rule}:{}:{}:{}",
+            "folder:{rule}:{}:{}:{}:{}",
             self.path.display(),
             self.size,
-            self.mtime
+            self.mtime,
+            self.ctime
         )
     }
 }
@@ -66,7 +69,7 @@ impl FolderWatch {
         })
     }
 
-    fn list(&self) -> Result<HashMap<String, (u64, i128)>> {
+    fn list(&self) -> Result<HashMap<String, (u64, i128, i128)>> {
         let mut out = HashMap::new();
         let entries = std::fs::read_dir(&self.folder)
             .with_context(|| format!("reading {}", self.folder.display()))?;
@@ -87,7 +90,11 @@ impl FolderWatch {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_nanos() as i128)
                 .unwrap_or(0);
-            out.insert(name, (meta.len(), mtime));
+            let ctime = {
+                use std::os::unix::fs::MetadataExt;
+                meta.ctime() as i128 * 1_000_000_000 + meta.ctime_nsec() as i128
+            };
+            out.insert(name, (meta.len(), mtime, ctime));
         }
         Ok(out)
     }
@@ -116,6 +123,7 @@ impl FolderWatch {
                     path: self.folder.join(name),
                     size: meta.0,
                     mtime: meta.1,
+                    ctime: meta.2,
                 });
             }
         }

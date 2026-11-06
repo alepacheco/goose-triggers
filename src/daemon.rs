@@ -27,7 +27,33 @@ extern "C" fn on_signal(_: libc::c_int) {
 
 /// One line of the daemon's output.
 pub fn say(what: &str) {
-    eprintln!("[{}] {what}", fmt_time(now()));
+    eprintln!("[{}] {}", fmt_time(now()), crate::util::clean(what));
+}
+
+/// Whether `pid` is still the goose process goose-triggers started for `run` (its
+/// environment names the run), so a reused pid is never signalled.
+fn our_goose(pid: i64, run: i64) -> bool {
+    let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
+    let want = format!("{}={run}", crate::hook::ENV_RUN);
+    env.split(|b| *b == 0).any(|kv| kv == want.as_bytes())
+}
+
+/// After an unclean stop, a goose that goose-triggers started may still be winding down
+/// (it got SIGINT when goose-triggers died): wait for it, then make sure it is gone.
+fn wait_for_old_goose(pid: i64, run: i64) {
+    let start = Instant::now();
+    while our_goose(pid, run) {
+        if start.elapsed() > Duration::from_secs(15) {
+            // SAFETY: the process is ours, as its environment shows.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Holds the state folder's lock while `goose-triggers run` runs: one daemon per state folder.
@@ -67,9 +93,10 @@ pub fn is_running(state_dir: &Path) -> bool {
 /// Stores an event and queues its run (a failed run, saying why, when the event lacks a
 /// parameter the recipe needs). `None` when the event was stored before.
 /// Tools that reach other tools or start new ones out of the hook's sight: code mode runs
-/// tool calls inside JavaScript, and the extension manager turns on extensions mid-run. A
-/// rule that holds anything holds these too.
-pub const IMPLICIT_HOLDS: &[&str] = &["*execute_javascript", "*manage_extensions"];
+/// tool calls inside JavaScript, the extension manager turns on extensions mid-run, and
+/// delegate starts a subagent with a recipe's extensions. A rule that holds anything holds
+/// these too.
+pub const IMPLICIT_HOLDS: &[&str] = &["*execute_javascript", "*manage_extensions", "*delegate"];
 
 /// A run's hold patterns: the rule's, and the implicit ones when it has any.
 pub fn run_holds(rule_holds: &[String]) -> Vec<String> {
@@ -240,6 +267,9 @@ pub fn run(cfg: Config) -> Result<()> {
     }
 
     for r in store.runs_in(state::RUNNING)? {
+        if let Some(pid) = r.pid {
+            wait_for_old_goose(pid, r.id);
+        }
         if store.has_open_permission(r.id)? {
             // A resumed run that had not made its approved call yet: resume it again.
             store.transition(r.id, &[state::RUNNING], state::APPROVED, None)?;
@@ -359,6 +389,7 @@ mod tests {
         assert!(matches_hold(&h, "code_execution__execute_javascript"));
         assert!(matches_hold(&h, "manage_extensions"));
         assert!(matches_hold(&h, "extensionmanager__manage_extensions"));
+        assert!(matches_hold(&h, "delegate"));
         assert!(!matches_hold(&h, "tree"));
     }
 }

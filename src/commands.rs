@@ -126,6 +126,8 @@ fn describe(v: &Value) -> Vec<String> {
                         let r = p.get("toolResult");
                         let ok = r.and_then(|r| r.get("status")).and_then(Value::as_str)
                             == Some("success");
+                        let is_error =
+                            r.and_then(|r| r.pointer("/value/isError")) == Some(&Value::Bool(true));
                         let text = if ok {
                             r.and_then(|r| r.pointer("/value/content/0/text"))
                                 .and_then(Value::as_str)
@@ -140,7 +142,11 @@ fn describe(v: &Value) -> Vec<String> {
                                 })
                                 .unwrap_or_default()
                         };
-                        let tag = if ok { "tool result" } else { "tool error" };
+                        let tag = if ok && !is_error {
+                            "tool result"
+                        } else {
+                            "tool error"
+                        };
                         out.push(format!("{tag}: {}", short(text.trim(), 200)));
                     }
                     _ => {}
@@ -173,7 +179,7 @@ pub fn log(cfg: &Config, run: Option<i64>) -> Result<()> {
         fmt_time(r.created_at)
     );
     if let Some(e) = &r.error {
-        println!("error: {e}");
+        println!("error: {}", clean(e));
     }
     println!("recipe: {}", r.recipe);
     if let Some(ev) = store.event(r.event_id)? {
@@ -231,12 +237,30 @@ fn refuse_inside_a_run() -> Result<()> {
     Ok(())
 }
 
-pub fn approve(cfg: &Config, run: i64) -> Result<()> {
+pub fn approve(cfg: &Config, run: i64, yes: bool) -> Result<()> {
     refuse_inside_a_run()?;
     let store = open(cfg)?;
-    let call = store.approve(run)?;
-    println!("run {run}: approved {} with input", clean(&call.tool_name));
-    println!("{}", indent(&full_call(&call.tool_input), "  "));
+    let Some(shown) = store.pending_call(run)? else {
+        // Let the store say why (no such run, not held).
+        store.approve(run)?;
+        return Ok(());
+    };
+    println!("run {run} waits on {} with input", clean(&shown.tool_name));
+    println!("{}", indent(&full_call(&shown.tool_input), "  "));
+    // SAFETY: isatty only inspects a file descriptor.
+    let interactive = unsafe { libc::isatty(0) } == 1;
+    if interactive && !yes {
+        print!("Approve this call? [y/N] ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("not approved; the run stays held");
+            return Ok(());
+        }
+    }
+    store.approve_call(run, shown.id)?;
+    println!("run {run}: approved");
     if crate::daemon::is_running(&cfg.state_dir) {
         println!("goose-triggers resumes its goose session now; that exact call may run once.");
     } else {
@@ -251,8 +275,8 @@ pub fn reject(cfg: &Config, run: i64) -> Result<()> {
     let call = store.reject(run)?;
     println!(
         "run {run}: rejected {} {}; the run has ended",
-        call.tool_name,
-        short(&call.tool_input, 200)
+        clean(&call.tool_name),
+        call_line(&call.tool_input, 200)
     );
     Ok(())
 }

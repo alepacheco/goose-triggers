@@ -192,6 +192,17 @@ impl Store {
             crate::util::create_private_dir(dir)
                 .with_context(|| format!("creating {}", dir.display()))?;
         }
+        if !path.exists() {
+            use std::os::unix::fs::OpenOptionsExt;
+            // SQLite gives its journal files the database file's permissions.
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600)
+                .open(path)
+                .with_context(|| format!("creating {}", path.display()))?;
+        }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -454,15 +465,21 @@ impl Store {
     /// Approves the call a held run waits on: a one-time permission for that tool name and
     /// input, and the run is queued to resume.
     pub fn approve(&self, run_id: i64) -> Result<Call> {
-        self.decide(run_id, true)
+        self.decide(run_id, true, None)
+    }
+
+    /// Approves the call a held run waits on only if it is still call `expected`, the one the
+    /// user was shown.
+    pub fn approve_call(&self, run_id: i64, expected: i64) -> Result<Call> {
+        self.decide(run_id, true, Some(expected))
     }
 
     /// Rejects the call a held run waits on: the run ends.
     pub fn reject(&self, run_id: i64) -> Result<Call> {
-        self.decide(run_id, false)
+        self.decide(run_id, false, None)
     }
 
-    fn decide(&self, run_id: i64, approve: bool) -> Result<Call> {
+    fn decide(&self, run_id: i64, approve: bool, expected: Option<i64>) -> Result<Call> {
         let tx = self.immediate()?;
         let st: Option<String> = tx
             .query_row("SELECT state FROM runs WHERE id = ?1", [run_id], |r| {
@@ -483,6 +500,9 @@ impl Store {
             )
             .optional()?
             .with_context(|| format!("run {run_id} is held but has no pending call"))?;
+        if expected.is_some_and(|e| e != call.id) {
+            bail!("run {run_id} now waits on another call than the one shown: look at it again (goose-triggers log {run_id})");
+        }
         let t = now();
         let (call_state, run_state) = if approve {
             ("approved", state::APPROVED)

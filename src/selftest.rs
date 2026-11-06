@@ -282,9 +282,23 @@ impl Selftest {
                 call.tool_input
             ),
         )?;
+        let tl = self.store()?.timeline(folder_run)?;
+        let held_at = tl
+            .iter()
+            .find(|l| l.what.starts_with("held:"))
+            .map(|l| l.at);
+        let stopped_at = tl
+            .iter()
+            .find(|l| {
+                l.what
+                    .starts_with("goose-triggers stopped goose at the hold")
+            })
+            .map(|l| l.at);
+        // The scripted model takes 30 s to answer after a denial: a stop within 5 s of the
+        // hold is goose-triggers' doing.
         self.check(
-            self.timeline_has(folder_run, "goose-triggers stopped goose at the hold")?,
-            "goose-triggers stopped the headless goose run at the hold",
+            matches!((held_at, stopped_at), (Some(h), Some(s)) if s - h <= 5),
+            "goose-triggers stopped the headless goose run at the hold, once goose had recorded the denial",
         )?;
 
         // The webhook: the secret is checked, and an event starts a run that is held too.
@@ -411,7 +425,7 @@ impl Selftest {
         let injected = self.dir.join("work/webhook/injected");
         self.check(
             r.state == state::FAILED
-                && r.error.as_deref().is_some_and(|e| e.contains("the run was not started"))
+                && r.error.as_deref().is_some_and(|e| e.contains("would change the recipe itself"))
                 && r.session_id.is_none()
                 && !injected.exists(),
             &format!(

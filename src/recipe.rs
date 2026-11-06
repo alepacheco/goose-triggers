@@ -17,6 +17,7 @@ struct RawRecipe {
 #[derive(Debug, Deserialize)]
 struct RawParam {
     key: String,
+    input_type: Option<String>,
     requirement: Option<String>,
     default: Option<serde_yaml_ng::Value>,
 }
@@ -31,6 +32,9 @@ pub struct Param {
     pub key: String,
     /// The event must have this field: the recipe requires it and gives no default.
     pub needed: bool,
+    /// An `input_type: file` parameter: goose reads the file at the path given and pastes its
+    /// contents into the recipe's text.
+    pub file: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +60,7 @@ pub fn parse(text: &str) -> Result<RecipeInfo> {
         .into_iter()
         .map(|p| Param {
             needed: p.default.is_none() && p.requirement.as_deref() != Some("optional"),
+            file: p.input_type.as_deref() == Some("file"),
             key: p.key,
         })
         .collect();
@@ -66,7 +71,8 @@ pub fn parse(text: &str) -> Result<RecipeInfo> {
 }
 
 fn path_is_json(text: &str) -> bool {
-    text.trim_start().starts_with('{')
+    let t = text.trim_start();
+    t.starts_with('{') && !t.starts_with("{%") && !t.starts_with("{{")
 }
 
 /// The `--params` for a run: each parameter the recipe declares, from the event field of the
@@ -80,6 +86,10 @@ pub fn params_for(
     let mut missing = Vec::new();
     for p in &info.params {
         match fields.get(&p.key) {
+            Some(_) if p.file => bail!(
+                "the recipe's parameter {} is a file parameter: goose would paste the contents of the file it names into the recipe itself, so goose-triggers does not fill file parameters from events. Declare it as a string and have the recipe read the file with its tools",
+                p.key
+            ),
             Some(v) => out.push((p.key.clone(), v.clone())),
             None if p.needed => missing.push(p.key.clone()),
             None => {}
@@ -117,6 +127,7 @@ pub fn check_values_stay_text(
     recipe: &Path,
     params: &[(String, String)],
     wd: &Path,
+    hide_env: Option<&str>,
 ) -> Result<()> {
     if params.iter().all(|(_, v)| inert(v)) {
         return Ok(());
@@ -136,93 +147,145 @@ pub fn check_values_stay_text(
             placeholders.push((k.clone(), t));
         }
     }
-    let template = render(goose, recipe, &placeholders, wd)
+    let template = render(goose, recipe, &placeholders, wd, hide_env)
         .context("goose could not render the recipe with placeholder values")?;
-    let real = render(goose, recipe, params, wd).map_err(|e| {
+    let real = render(goose, recipe, params, wd, hide_env).map_err(|e| {
         anyhow::anyhow!(
             "with the event's values, goose cannot read the recipe ({e:#}); the run was not started"
         )
     })?;
-    if !same_shape(&real, &template, &tokens) {
-        bail!("the event's values would change the recipe itself, not only fill in its text (a value carries YAML or JSON syntax); the run was not started");
+    if !same_recipe(&real, &template, &tokens) {
+        bail!("the event's values would change the recipe itself, not only fill in its text (a value carries YAML or JSON syntax, or fills in a field other than {}); the run was not started", TEXT_FIELDS.join(", "));
     }
     Ok(())
 }
+
+/// How long goose may take to render a recipe.
+const RENDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn render(
     goose: &str,
     recipe: &Path,
     params: &[(String, String)],
     wd: &Path,
+    hide_env: Option<&str>,
 ) -> Result<serde_yaml_ng::Value> {
+    use std::io::Read;
     let mut cmd = std::process::Command::new(goose);
     cmd.arg("run").arg("--recipe").arg(recipe);
     for (k, v) in params {
         cmd.arg("--params").arg(format!("{k}={v}"));
     }
-    let out = cmd
-        .arg("--render-recipe")
+    cmd.arg("--render-recipe")
         .current_dir(wd)
         .env_remove(crate::hook::ENV_RUN)
         .stdin(std::process::Stdio::null())
-        .output()
-        .with_context(|| format!("running {goose}"))?;
-    if !out.status.success() {
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(var) = hide_env {
+        cmd.env_remove(var);
+    }
+    let mut child = cmd.spawn().with_context(|| format!("running {goose}"))?;
+    let mut stdout = child.stdout.take().context("goose's output")?;
+    let mut stderr = child.stderr.take().context("goose's errors")?;
+    let out_reader = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = stdout.read_to_end(&mut b);
+        b
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = stderr.read_to_end(&mut b);
+        b
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if start.elapsed() > RENDER_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "goose took over {} s to render the recipe",
+                RENDER_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let out = out_reader.join().unwrap_or_default();
+    let err = err_reader.join().unwrap_or_default();
+    if !status.success() {
         let text = format!(
             "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&err)
         );
         bail!("{}", crate::util::short(text.trim(), 300));
     }
-    Ok(serde_yaml_ng::from_slice(&out.stdout)?)
+    Ok(serde_yaml_ng::from_slice(&out)?)
 }
 
-fn fill(text: &str, tokens: &[(String, String)]) -> String {
-    let mut out = text.to_string();
-    for (t, v) in tokens {
-        out = out.replace(t.as_str(), v);
-    }
-    out
-}
+/// The recipe fields an event's value may fill in: text the model reads, nothing goose runs
+/// or configures from.
+pub const TEXT_FIELDS: &[&str] = &[
+    "prompt",
+    "instructions",
+    "title",
+    "description",
+    "activities",
+    "author",
+];
 
-fn scalar_text(v: &serde_yaml_ng::Value) -> Option<String> {
+fn is_scalar(v: &serde_yaml_ng::Value) -> bool {
     use serde_yaml_ng::Value as Y;
-    match v {
-        Y::String(s) => Some(s.clone()),
-        Y::Number(n) => Some(n.to_string()),
-        Y::Bool(b) => Some(b.to_string()),
-        Y::Null => Some(String::new()),
-        _ => None,
-    }
+    matches!(v, Y::String(_) | Y::Number(_) | Y::Bool(_) | Y::Null)
 }
 
-/// Whether `real` is `template` with the placeholder tokens replaced by their values inside
-/// text, and no other difference.
-pub fn same_shape(
+/// Whether the recipe rendered with the event's values (`real`) is the one rendered with
+/// placeholder tokens (`template`), except for text the tokens filled in, and only in
+/// `TEXT_FIELDS`.
+pub fn same_recipe(
     real: &serde_yaml_ng::Value,
     template: &serde_yaml_ng::Value,
     tokens: &[(String, String)],
 ) -> bool {
     use serde_yaml_ng::Value as Y;
+    let (Y::Mapping(a), Y::Mapping(b)) = (real, template) else {
+        return same_shape(real, template, tokens, false);
+    };
+    a.len() == b.len()
+        && b.iter().all(|(k, vb)| {
+            let text = k.as_str().is_some_and(|k| TEXT_FIELDS.contains(&k));
+            a.get(k).is_some_and(|va| same_shape(va, vb, tokens, text))
+        })
+}
+
+/// Whether `real` is `template` with no difference but text filled in from the tokens, where
+/// `text` allows that. Keys must match exactly; a string holding a token may come out as any
+/// text (the structure around it is already the same).
+pub fn same_shape(
+    real: &serde_yaml_ng::Value,
+    template: &serde_yaml_ng::Value,
+    tokens: &[(String, String)],
+    text: bool,
+) -> bool {
+    use serde_yaml_ng::Value as Y;
     match (real, template) {
         (Y::Mapping(a), Y::Mapping(b)) => {
             a.len() == b.len()
-                && b.iter().all(|(k, vb)| {
-                    let k = match k {
-                        Y::String(s) => Y::String(fill(s, tokens)),
-                        other => other.clone(),
-                    };
-                    a.get(&k).is_some_and(|va| same_shape(va, vb, tokens))
-                })
+                && b.iter()
+                    .all(|(k, vb)| a.get(k).is_some_and(|va| same_shape(va, vb, tokens, text)))
         }
         (Y::Sequence(a), Y::Sequence(b)) => {
-            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| same_shape(x, y, tokens))
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| same_shape(x, y, tokens, text))
         }
-        (Y::Tagged(a), Y::Tagged(b)) => a.tag == b.tag && same_shape(&a.value, &b.value, tokens),
-        (Y::Mapping(_) | Y::Sequence(_) | Y::Tagged(_), _)
-        | (_, Y::Mapping(_) | Y::Sequence(_) | Y::Tagged(_)) => false,
-        (a, Y::String(b)) => scalar_text(a).is_some_and(|t| t == fill(b, tokens)),
+        (Y::Tagged(a), Y::Tagged(b)) => {
+            a.tag == b.tag && same_shape(&a.value, &b.value, tokens, text)
+        }
+        (a, Y::String(b)) if tokens.iter().any(|(t, _)| b.contains(t.as_str())) => {
+            text && is_scalar(a)
+        }
         (a, b) => a == b,
     }
 }
@@ -265,23 +328,39 @@ prompt: "{{ file_path }} {{ note }} {{ who }}"
             "title: t\nprompt: 'see TOKEN0 now'\nextensions: [{type: builtin, name: developer}]\n",
         );
         let real = y("title: t\nprompt: 'see a \"quoted\" value: {x} now'\nextensions: [{type: builtin, name: developer}]\n");
-        assert!(same_shape(&real, &template, &t));
+        assert!(same_recipe(&real, &template, &t));
+        // Text the YAML parser reshaped (line breaks, folding) is still text.
+        let real = y("title: t\nprompt: \"see a\\n b now\"\nextensions: [{type: builtin, name: developer}]\n");
+        assert!(same_recipe(&real, &template, &t));
+        // A number that came from a value, in a text field.
+        assert!(same_recipe(&y("prompt: 5\n"), &y("prompt: 'TOKEN0'\n"), &t));
     }
 
     #[test]
-    fn values_that_add_keys_or_items_change_the_shape() {
+    fn values_that_add_keys_or_items_or_fill_other_fields_are_refused() {
         let t = vec![("TOKEN0".to_string(), "x".to_string())];
         let template = y("prompt: 'TOKEN0'\nextensions: [{type: builtin, name: developer}]\n");
         let added_key = y("prompt: 'x'\nretry: {checks: [{type: shell, command: touch p}]}\nextensions: [{type: builtin, name: developer}]\n");
         let added_item = y("prompt: 'x'\nextensions: [{type: builtin, name: developer}, {type: stdio, name: e, cmd: sh}]\n");
-        let changed_text = y("prompt: 'y'\nextensions: [{type: builtin, name: developer}]\n");
-        assert!(!same_shape(&added_key, &template, &t));
-        assert!(!same_shape(&added_item, &template, &t));
-        assert!(!same_shape(&changed_text, &template, &t));
-        // A number filled in from a value is fine.
-        let template = y("settings: {max_turns: 'TOKEN0'}\n");
-        let t = vec![("TOKEN0".to_string(), "5".to_string())];
-        assert!(same_shape(&y("settings: {max_turns: 5}\n"), &template, &t));
+        assert!(!same_recipe(&added_key, &template, &t));
+        assert!(!same_recipe(&added_item, &template, &t));
+        // Text without a token must not change.
+        let template = y("title: fixed\nprompt: 'TOKEN0'\n");
+        assert!(!same_recipe(
+            &y("title: other\nprompt: 'x'\n"),
+            &template,
+            &t
+        ));
+        // A value may not fill in what goose runs or configures from.
+        let template = y("prompt: p\nextensions: [{type: stdio, name: e, cmd: 'TOKEN0'}]\n");
+        let real = y("prompt: p\nextensions: [{type: stdio, name: e, cmd: x}]\n");
+        assert!(!same_recipe(&real, &template, &t));
+        let template = y("prompt: p\nsettings: {goose_provider: 'TOKEN0'}\n");
+        assert!(!same_recipe(
+            &y("prompt: p\nsettings: {goose_provider: x}\n"),
+            &template,
+            &t
+        ));
     }
 
     #[test]
@@ -295,6 +374,16 @@ prompt: "{{ file_path }} {{ note }} {{ who }}"
         ] {
             assert!(!inert(v), "{v:?}");
         }
+    }
+
+    #[test]
+    fn file_parameters_are_not_filled_from_events() {
+        let info = parse("parameters:\n  - {key: doc, input_type: file, requirement: required, description: d}\nprompt: '{{ doc }}'\n").unwrap();
+        assert!(info.params[0].file);
+        let mut fields = BTreeMap::new();
+        fields.insert("doc".to_string(), "/home/me/.ssh/id_rsa".to_string());
+        let err = params_for(&info, &fields).unwrap_err().to_string();
+        assert!(err.contains("file parameter"), "{err}");
     }
 
     #[test]

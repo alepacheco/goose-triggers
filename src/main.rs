@@ -55,6 +55,9 @@ enum Cmd {
     Approve {
         /// The run's number, as `status` shows it
         run: i64,
+        /// Approve without asking (it asks only when run from a terminal)
+        #[arg(long, short)]
+        yes: bool,
     },
     /// Reject the call a held run waits on: the run ends
     Reject {
@@ -86,8 +89,8 @@ fn main() -> ExitCode {
             .and_then(|c| commands::status(&c, all)),
         Cmd::Log { run } => config::Config::load_for_state(cli.config.as_deref())
             .and_then(|c| commands::log(&c, run)),
-        Cmd::Approve { run } => config::Config::load_for_state(cli.config.as_deref())
-            .and_then(|c| commands::approve(&c, run)),
+        Cmd::Approve { run, yes } => config::Config::load_for_state(cli.config.as_deref())
+            .and_then(|c| commands::approve(&c, run, yes)),
         Cmd::Reject { run } => config::Config::load_for_state(cli.config.as_deref())
             .and_then(|c| commands::reject(&c, run)),
         Cmd::Selftest { goose, keep } => selftest::run(goose, keep),

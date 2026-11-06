@@ -149,6 +149,14 @@ fn signal_group(pid: u32, sig: libc::c_int) {
     }
 }
 
+/// The environment variable holding the webhook secret, kept from goose.
+fn hidden_env(ctx: &Ctx) -> Option<&str> {
+    ctx.cfg
+        .webhook
+        .as_ref()
+        .and_then(|w| w.secret_env.as_deref())
+}
+
 fn goose_command(ctx: &Ctx, run: &Run, mode: &Mode, wd: &Path, stderr: File) -> Result<Command> {
     let mut cmd = Command::new(&ctx.cfg.goose);
     cmd.arg("run");
@@ -186,12 +194,7 @@ fn goose_command(ctx: &Ctx, run: &Run, mode: &Mode, wd: &Path, stderr: File) -> 
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
-    if let Some(var) = ctx
-        .cfg
-        .webhook
-        .as_ref()
-        .and_then(|w| w.secret_env.as_deref())
-    {
+    if let Some(var) = hidden_env(ctx) {
         // goose and the commands it runs do not need the webhook secret.
         cmd.env_remove(var);
     }
@@ -224,10 +227,14 @@ fn tool_responses(v: &Value) -> Vec<(String, bool)> {
                 .filter(|p| p.get("type").and_then(Value::as_str) == Some("toolResponse"))
                 .filter_map(|p| {
                     let id = p.get("id").and_then(Value::as_str)?.to_string();
-                    // "success" means the tool ran (its own result may still be an error);
-                    // "error" means goose did not run it (a hook denied it, say).
-                    let ran =
-                        p.pointer("/toolResult/status").and_then(Value::as_str) == Some("success");
+                    // A tool that ran answers "success" without isError. A denial, an unknown
+                    // tool or a call goose could not parse answers "error", or "success" with
+                    // isError, and goose's hooks are not run for the last two.
+                    let ran = p.pointer("/toolResult/status").and_then(Value::as_str)
+                        == Some("success")
+                        && p.pointer("/toolResult/value/isError")
+                            .and_then(Value::as_bool)
+                            != Some(true);
                     Some((id, ran))
                 })
                 .collect()
@@ -315,21 +322,28 @@ fn run_goose(ctx: &Ctx, run: &Run, mode: &Mode) -> Result<()> {
             Path::new(&run.recipe),
             &run.params,
             &wd,
+            hidden_env(ctx),
         )?;
     }
 
     let runs_dir = ctx.cfg.runs_dir();
     crate::util::create_private_dir(&runs_dir)?;
-    let stderr = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(runs_dir.join(format!("{}.stderr", run.id)))?;
-    let out_log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(runs_dir.join(format!("{}.jsonl", run.id)))?;
+    let private = |name: String| {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(runs_dir.join(name))
+    };
+    let stderr = private(format!("{}.stderr", run.id))?;
+    let out_log = private(format!("{}.jsonl", run.id))?;
     let mut cmd = goose_command(ctx, run, mode, &wd, stderr)?;
 
+    if STOP.load(Ordering::SeqCst) {
+        // goose-triggers is stopping: leave the run to start at the next start.
+        return Ok(());
+    }
     let from = match mode {
         Mode::Start => state::QUEUED,
         Mode::Resume(_) => state::APPROVED,
@@ -389,49 +403,64 @@ fn watch(
     let mut saw_complete = false;
     let mut last_error: Option<String> = None;
     let mut unseen_call: Option<String> = None;
-    let status;
+    let mut checked = Instant::now() - Duration::from_secs(1);
 
-    loop {
-        if let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
-            if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                match v.get("type").and_then(Value::as_str) {
-                    Some("complete") => saw_complete = true,
-                    Some("error") => {
-                        last_error = v.get("error").or_else(|| v.get("message")).map(|e| {
-                            e.as_str()
-                                .map(str::to_string)
-                                .unwrap_or_else(|| e.to_string())
-                        })
-                    }
-                    _ => {}
-                }
-                for (id, ran) in tool_responses(&v) {
-                    if ran && !store.hook_saw(run.id, &id)? {
-                        // goose ran a tool that goose-triggers' hook never saw: the plugin is
-                        // not active, so nothing would be held.
-                        unseen_call.get_or_insert(id.clone());
-                        stopper.stop(Kill::NoHook);
-                    }
-                    if hold.as_ref().and_then(|h| h.1.as_deref()) == Some(id.as_str()) {
-                        // goose has recorded the denial; stop it now.
-                        stopper.stop(Kill::Hold);
-                    }
+    // One line of goose's output.
+    let mut on_line = |line: &str,
+                       hold: &Option<(Instant, Option<String>)>,
+                       stopper: &mut Stopper|
+     -> Result<()> {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            return Ok(());
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("complete") => saw_complete = true,
+            Some("error") => {
+                last_error = v.get("error").or_else(|| v.get("message")).map(|e| {
+                    e.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| e.to_string())
+                })
+            }
+            _ => {}
+        }
+        for (id, ran) in tool_responses(&v) {
+            if ran && !store.hook_saw(run.id, &id)? {
+                // goose ran a tool that goose-triggers' hook never saw: the plugin is not
+                // active, so nothing would be held.
+                unseen_call.get_or_insert(id.clone());
+                stopper.stop(Kill::NoHook);
+            }
+            if hold.as_ref().and_then(|h| h.1.as_deref()) == Some(id.as_str()) {
+                // goose has recorded the denial; stop it now.
+                stopper.stop(Kill::Hold);
+            }
+        }
+        Ok(())
+    };
+
+    // Responses seen before the hold was noticed.
+    let mut answered: Vec<String> = Vec::new();
+    let status = loop {
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(100)) {
+            if hold.is_none() {
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                    answered.extend(tool_responses(&v).into_iter().map(|(id, _)| id));
                 }
             }
-            continue;
+            on_line(&line, &hold, &mut stopper)?;
         }
-
         if let Some(st) = child.try_wait()? {
             // goose exited: take what is left of its output.
             while let Ok(line) = rx.recv_timeout(Duration::from_millis(300)) {
-                if line.contains("\"type\":\"complete\"") {
-                    saw_complete = true;
-                }
+                on_line(&line, &hold, &mut stopper)?;
             }
-            status = st;
-            break;
+            break st;
         }
-
+        if checked.elapsed() < Duration::from_millis(200) {
+            continue;
+        }
+        checked = Instant::now();
         let cur = store.run(run.id)?.context("the run left the store")?;
         if hold.is_none() && cur.state == state::HELD {
             let call = store.pending_call(run.id)?;
@@ -445,7 +474,7 @@ fn watch(
                     call_line(&c.tool_input, 120)
                 ));
             }
-            if call_id.is_none() {
+            if call_id.as_ref().is_none_or(|cid| answered.contains(cid)) {
                 stopper.stop(Kill::Hold);
             }
             hold = Some((Instant::now(), call_id));
@@ -460,7 +489,7 @@ fn watch(
             stopper.stop(Kill::Stop);
         }
         stopper.escalate();
-    }
+    };
     Ok(Watched {
         status,
         kill: stopper.reason(),
@@ -478,9 +507,12 @@ fn finish(store: &Store, run: &Run, mode: &Mode, wd: &Path, w: Watched) -> Resul
         say(&format!("run {id} ({}): {what}", run.rule));
         Ok(())
     };
+    // Each outcome is logged only if the run was still running when it was recorded.
     let fail = |msg: &str| -> Result<()> {
-        store.transition(id, &[state::RUNNING], state::FAILED, Some(msg))?;
-        say_log(&format!("failed: {msg}"))
+        if store.transition(id, &[state::RUNNING], state::FAILED, Some(msg))? {
+            say_log(&format!("failed: {msg}"))?;
+        }
+        Ok(())
     };
     if cur.state == state::HELD {
         let how = match w.kill {
@@ -504,7 +536,9 @@ fn finish(store: &Store, run: &Run, mode: &Mode, wd: &Path, w: Watched) -> Resul
     if w.kill == Some(Kill::Stop) {
         if matches!(mode, Mode::Resume(_)) && store.has_open_permission(id)? {
             // The approved call was not made yet: resume again at the next start.
-            store.transition(id, &[state::RUNNING], state::APPROVED, None)?;
+            if !store.transition(id, &[state::RUNNING], state::APPROVED, None)? {
+                return Ok(());
+            }
             return say_log("goose-triggers was stopped before the approved call was made; the run resumes when it starts again");
         }
         return fail("goose-triggers was stopped while the run was going");
@@ -516,8 +550,10 @@ fn finish(store: &Store, run: &Run, mode: &Mode, wd: &Path, w: Watched) -> Resul
         ));
     }
     if w.status.success() && w.saw_complete {
-        store.transition(id, &[state::RUNNING], state::DONE, None)?;
-        return say_log("done");
+        if store.transition(id, &[state::RUNNING], state::DONE, None)? {
+            say_log("done")?;
+        }
+        return Ok(());
     }
     fail(&format!(
         "goose exited with {}{}; see goose-triggers log {id}",
@@ -537,11 +573,16 @@ mod tests {
     fn reads_tool_responses_and_whether_they_ran() {
         let v = json!({"type": "message", "message": {"role": "user", "content": [
             {"type": "toolResponse", "id": "call_7", "toolResult": {"status": "error", "error": "denied"}},
-            {"type": "toolResponse", "id": "call_8", "toolResult": {"status": "success", "value": {}}}
+            {"type": "toolResponse", "id": "call_8", "toolResult": {"status": "success", "value": {"isError": false}}},
+            {"type": "toolResponse", "id": "call_9", "toolResult": {"status": "success", "value": {"isError": true}}}
         ]}});
         assert_eq!(
             tool_responses(&v),
-            vec![("call_7".to_string(), false), ("call_8".to_string(), true)]
+            vec![
+                ("call_7".to_string(), false),
+                ("call_8".to_string(), true),
+                ("call_9".to_string(), false)
+            ]
         );
         let v = json!({"type": "message", "message": {"role": "assistant", "content": [
             {"type": "toolRequest", "id": "call_7"}
