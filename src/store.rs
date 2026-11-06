@@ -452,6 +452,26 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// How many calls the hook has decided on in a run.
+    pub fn decision_count(&self, run_id: i64) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM decisions WHERE run_id = ?1",
+            [run_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Runs whose goose process was recorded as alive, in any state.
+    pub fn runs_with_pid(&self) -> Result<Vec<Run>> {
+        let sql = format!(
+            "SELECT {} FROM runs WHERE pid IS NOT NULL ORDER BY id",
+            Self::RUN_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::run_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Whether a run holds an approval not yet used.
     pub fn has_open_permission(&self, run_id: i64) -> Result<bool> {
         let n: i64 = self.conn.query_row(
@@ -464,6 +484,7 @@ impl Store {
 
     /// Approves the call a held run waits on: a one-time permission for that tool name and
     /// input, and the run is queued to resume.
+    #[cfg(test)]
     pub fn approve(&self, run_id: i64) -> Result<Call> {
         self.decide(run_id, true, None)
     }

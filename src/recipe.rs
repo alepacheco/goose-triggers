@@ -110,27 +110,27 @@ pub fn params_for(
     Ok(out)
 }
 
-/// A value that cannot change a YAML or JSON document's structure wherever a template puts
-/// it: letters, digits, spaces and `._-/@+=`.
-pub fn inert(v: &str) -> bool {
-    v.chars()
-        .all(|c| c.is_alphanumeric() || " ._-/@+=".contains(c))
-}
-
 /// goose fills `{{ param }}` into the recipe file's text before it parses it, so a value
 /// with YAML or JSON syntax in it could add keys to the recipe (extensions, retry commands)
-/// that no hold would see. This renders the recipe through goose twice, with the real values
-/// and with placeholders, and refuses the run unless both have the same structure and the
-/// values only fill in text. Values that are inert need no check.
+/// that no hold would see, and a value placed in an extension's command or the provider
+/// setting would choose what goose runs. This renders the recipe through goose with the
+/// event's values and, when there are any, with a placeholder for each; the run goes ahead
+/// only if both have the same structure and the values fill in nothing but `TEXT_FIELDS`.
+/// Returns the recipe as rendered with the event's values.
 pub fn check_values_stay_text(
     goose: &str,
     recipe: &Path,
     params: &[(String, String)],
     wd: &Path,
     hide_env: Option<&str>,
-) -> Result<()> {
-    if params.iter().all(|(_, v)| inert(v)) {
-        return Ok(());
+) -> Result<serde_yaml_ng::Value> {
+    let real = render(goose, recipe, params, wd, hide_env).map_err(|e| {
+        anyhow::anyhow!(
+            "with the event's values, goose cannot read the recipe ({e:#}); the run was not started"
+        )
+    })?;
+    if params.is_empty() {
+        return Ok(real);
     }
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -139,25 +139,25 @@ pub fn check_values_stay_text(
     let mut tokens = Vec::new();
     let mut placeholders = Vec::new();
     for (i, (k, v)) in params.iter().enumerate() {
-        if inert(v) {
-            placeholders.push((k.clone(), v.clone()));
-        } else {
-            let t = format!("goosetriggersvalue{i}x{nonce}");
-            tokens.push((t.clone(), v.clone()));
-            placeholders.push((k.clone(), t));
-        }
+        let t = format!("goosetriggersvalue{i}x{nonce}");
+        tokens.push((t.clone(), v.clone()));
+        placeholders.push((k.clone(), t));
     }
     let template = render(goose, recipe, &placeholders, wd, hide_env)
         .context("goose could not render the recipe with placeholder values")?;
-    let real = render(goose, recipe, params, wd, hide_env).map_err(|e| {
-        anyhow::anyhow!(
-            "with the event's values, goose cannot read the recipe ({e:#}); the run was not started"
-        )
-    })?;
     if !same_recipe(&real, &template, &tokens) {
         bail!("the event's values would change the recipe itself, not only fill in its text (a value carries YAML or JSON syntax, or fills in a field other than {}); the run was not started", TEXT_FIELDS.join(", "));
     }
-    Ok(())
+    Ok(real)
+}
+
+/// The provider a rendered recipe asks for.
+pub fn rendered_provider(recipe: &serde_yaml_ng::Value) -> Option<String> {
+    recipe
+        .get("settings")?
+        .get("goose_provider")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// How long goose may take to render a recipe.
@@ -184,6 +184,19 @@ fn render(
         .stderr(std::process::Stdio::piped());
     if let Some(var) = hide_env {
         cmd.env_remove(var);
+    }
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own process group, so a Ctrl-C meant for goose-triggers does not end it.
+        cmd.process_group(0);
+        #[cfg(target_os = "linux")]
+        // SAFETY: prctl is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
     }
     let mut child = cmd.spawn().with_context(|| format!("running {goose}"))?;
     let mut stdout = child.stdout.take().context("goose's output")?;
@@ -361,19 +374,6 @@ prompt: "{{ file_path }} {{ note }} {{ who }}"
             &template,
             &t
         ));
-    }
-
-    #[test]
-    fn inert_values() {
-        assert!(inert("invoice-0001.txt"));
-        assert!(inert("/home/me/In box/a_b+c@d=e.pdf"));
-        assert!(inert("Ünïcödé 2026"));
-        for v in [
-            "a\nb", "a\"b", "a'b", "a: b", "a #b", "{x}", "[x]", "a,b", "a\\b", "a|b", "a>b",
-            "a*b", "a&b", "a!b", "a%b", "a`b",
-        ] {
-            assert!(!inert(v), "{v:?}");
-        }
     }
 
     #[test]

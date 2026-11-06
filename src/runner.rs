@@ -62,6 +62,13 @@ pub fn spawn(ctx: Ctx, run: Run, mode: Mode) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let id = run.id;
         if let Err(e) = run_goose(&ctx, &run, &mode) {
+            if STOP.load(Ordering::SeqCst) {
+                // goose-triggers is stopping (which may be what broke this): a run that had not
+                // started stays queued or approved for the next start; a running one is
+                // settled at the next start.
+                say(&format!("run {id} ({}): left for the next start", run.rule));
+                return;
+            }
             let msg = format!("{e:#}");
             say(&format!("run {id} ({}): failed: {msg}", run.rule));
             if let Ok(store) = Store::open(&ctx.db) {
@@ -214,8 +221,19 @@ fn goose_command(ctx: &Ctx, run: &Run, mode: &Mode, wd: &Path, stderr: File) -> 
     Ok(cmd)
 }
 
-/// The tool responses in a stream-json line: (tool call id, whether the tool ran) for each.
-fn tool_responses(v: &Value) -> Vec<(String, bool)> {
+/// A tool response in goose's output.
+#[derive(Debug, PartialEq, Eq)]
+struct ToolResponse {
+    id: String,
+    /// "success": goose dispatched the call. "error": it did not (a hook denied it).
+    success: bool,
+    /// The result is an error: the tool failed, or goose refused an unknown tool or a call it
+    /// could not parse without running its hooks.
+    is_error: bool,
+}
+
+/// The tool responses in a stream-json line.
+fn tool_responses(v: &Value) -> Vec<ToolResponse> {
     if v.get("type").and_then(Value::as_str) != Some("message") {
         return Vec::new();
     }
@@ -226,16 +244,15 @@ fn tool_responses(v: &Value) -> Vec<(String, bool)> {
                 .iter()
                 .filter(|p| p.get("type").and_then(Value::as_str) == Some("toolResponse"))
                 .filter_map(|p| {
-                    let id = p.get("id").and_then(Value::as_str)?.to_string();
-                    // A tool that ran answers "success" without isError. A denial, an unknown
-                    // tool or a call goose could not parse answers "error", or "success" with
-                    // isError, and goose's hooks are not run for the last two.
-                    let ran = p.pointer("/toolResult/status").and_then(Value::as_str)
-                        == Some("success")
-                        && p.pointer("/toolResult/value/isError")
+                    Some(ToolResponse {
+                        id: p.get("id").and_then(Value::as_str)?.to_string(),
+                        success: p.pointer("/toolResult/status").and_then(Value::as_str)
+                            == Some("success"),
+                        is_error: p
+                            .pointer("/toolResult/value/isError")
                             .and_then(Value::as_bool)
-                            != Some(true);
-                    Some((id, ran))
+                            == Some(true),
+                    })
                 })
                 .collect()
         })
@@ -317,13 +334,20 @@ fn run_goose(ctx: &Ctx, run: &Run, mode: &Mode) -> Result<()> {
     std::fs::create_dir_all(&wd).with_context(|| format!("creating {}", wd.display()))?;
     prepare_working_dir(ctx, run, &wd)?;
     if let Mode::Start = mode {
-        crate::recipe::check_values_stay_text(
+        let rendered = crate::recipe::check_values_stay_text(
             &ctx.cfg.goose,
             Path::new(&run.recipe),
             &run.params,
             &wd,
             hidden_env(ctx),
         )?;
+        if !run.holds.is_empty() && run.provider.is_none() {
+            if let Some(p) = crate::recipe::rendered_provider(&rendered) {
+                if is_cli_agent_provider(&p) {
+                    bail!("the recipe asks for provider {p}, which hands the run to another agent that runs its own tools: goose's hooks do not see those calls, so the rule's holds could not be enforced");
+                }
+            }
+        }
     }
 
     let runs_dir = ctx.cfg.runs_dir();
@@ -405,10 +429,16 @@ fn watch(
     let mut unseen_call: Option<String> = None;
     let mut checked = Instant::now() - Duration::from_secs(1);
 
-    // One line of goose's output.
+    // Decisions the hook had made for this run before this goose started: one made since
+    // shows goose loaded the plugin.
+    let decisions_before = store.decision_count(run.id)?;
+    let new_session = matches!(mode, Mode::Start);
+
+    // One line of goose's output. After goose has exited, nothing is signalled.
     let mut on_line = |line: &str,
                        hold: &Option<(Instant, Option<String>)>,
-                       stopper: &mut Stopper|
+                       stopper: &mut Stopper,
+                       exited: bool|
      -> Result<()> {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             return Ok(());
@@ -424,14 +454,21 @@ fn watch(
             }
             _ => {}
         }
-        for (id, ran) in tool_responses(&v) {
-            if ran && !store.hook_saw(run.id, &id)? {
-                // goose ran a tool that goose-triggers' hook never saw: the plugin is not
-                // active, so nothing would be held.
-                unseen_call.get_or_insert(id.clone());
-                stopper.stop(Kill::NoHook);
+        for r in tool_responses(&v) {
+            if r.success && !store.hook_saw(run.id, &r.id)? {
+                // A call the hook never saw. goose refuses an unknown tool or a call it cannot
+                // parse with an error result and no hook; any other unseen call ran without
+                // the hook, so the plugin is not active and nothing would be held.
+                let plugin_shown = store.decision_count(run.id)? > decisions_before
+                    || (new_session && store.run(run.id)?.is_some_and(|c| c.session_id.is_some()));
+                if !r.is_error || !plugin_shown {
+                    unseen_call.get_or_insert(r.id.clone());
+                    if !exited {
+                        stopper.stop(Kill::NoHook);
+                    }
+                }
             }
-            if hold.as_ref().and_then(|h| h.1.as_deref()) == Some(id.as_str()) {
+            if !exited && hold.as_ref().and_then(|h| h.1.as_deref()) == Some(r.id.as_str()) {
                 // goose has recorded the denial; stop it now.
                 stopper.stop(Kill::Hold);
             }
@@ -445,15 +482,15 @@ fn watch(
         if let Ok(line) = rx.recv_timeout(Duration::from_millis(100)) {
             if hold.is_none() {
                 if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                    answered.extend(tool_responses(&v).into_iter().map(|(id, _)| id));
+                    answered.extend(tool_responses(&v).into_iter().map(|r| r.id));
                 }
             }
-            on_line(&line, &hold, &mut stopper)?;
+            on_line(&line, &hold, &mut stopper, false)?;
         }
         if let Some(st) = child.try_wait()? {
             // goose exited: take what is left of its output.
             while let Ok(line) = rx.recv_timeout(Duration::from_millis(300)) {
-                on_line(&line, &hold, &mut stopper)?;
+                on_line(&line, &hold, &mut stopper, true)?;
             }
             break st;
         }
@@ -576,12 +613,17 @@ mod tests {
             {"type": "toolResponse", "id": "call_8", "toolResult": {"status": "success", "value": {"isError": false}}},
             {"type": "toolResponse", "id": "call_9", "toolResult": {"status": "success", "value": {"isError": true}}}
         ]}});
+        let r = |id: &str, success: bool, is_error: bool| ToolResponse {
+            id: id.into(),
+            success,
+            is_error,
+        };
         assert_eq!(
             tool_responses(&v),
             vec![
-                ("call_7".to_string(), false),
-                ("call_8".to_string(), true),
-                ("call_9".to_string(), false)
+                r("call_7", false, false),
+                r("call_8", true, false),
+                r("call_9", true, true)
             ]
         );
         let v = json!({"type": "message", "message": {"role": "assistant", "content": [

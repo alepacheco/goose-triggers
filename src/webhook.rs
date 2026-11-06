@@ -2,7 +2,8 @@
 //! secret as `Authorization: Bearer <secret>`.
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -107,29 +108,118 @@ pub fn handle(
 /// Starts the listener; it serves until `stop` is set.
 /// At most this many requests are handled at once; more get 503.
 const MAX_REQUESTS: usize = 16;
+/// A client gets this long for each read and write.
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// The request line and headers may take at most this much.
+const MAX_HEAD: usize = 16 << 10;
 
-fn respond(req: tiny_http::Request, r: Reply) {
-    let header =
-        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-    let response = tiny_http::Response::from_string(r.body.to_string())
-        .with_status_code(r.status)
-        .with_header(header);
-    let _ = req.respond(response);
+/// Writes a reply and closes the connection, without reading what the client still sends.
+fn respond(mut stream: &TcpStream, r: Reply) {
+    let reason = match r.status {
+        200 => "OK",
+        202 => "Accepted",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        411 => "Length Required",
+        413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
+        _ => "Internal Server Error",
+    };
+    let body = r.body.to_string();
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        r.status,
+        body.len()
+    );
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
-/// One request, on a thread of its own so a slow client holds up no one else.
-fn serve_one(cfg: &Config, secret: &str, mut req: tiny_http::Request) {
-    let method = req.method().as_str().to_string();
-    let url = req.url().to_string();
-    let auth = req
-        .headers()
+/// The request line and headers: (method, target, headers with lower-case names).
+type Head = (String, String, Vec<(String, String)>);
+
+fn read_head(reader: &mut BufReader<&TcpStream>) -> std::result::Result<Head, u16> {
+    let mut lines = Vec::new();
+    let mut total = 0;
+    loop {
+        let mut line = String::new();
+        let n = reader
+            .by_ref()
+            .take((MAX_HEAD - total + 1) as u64)
+            .read_line(&mut line)
+            .map_err(|_| 400u16)?;
+        total += n;
+        if n == 0 || total > MAX_HEAD {
+            return Err(if total > MAX_HEAD { 431 } else { 400 });
+        }
+        let line = line.trim_end_matches(['\r', '\n']).to_string();
+        if line.is_empty() {
+            break;
+        }
+        lines.push(line);
+    }
+    let mut parts = lines.first().ok_or(400u16)?.split_whitespace();
+    let method = parts.next().ok_or(400u16)?.to_string();
+    let target = parts.next().ok_or(400u16)?.to_string();
+    let headers = lines[1..]
         .iter()
-        .find(|h| h.field.equiv("Authorization"))
-        .map(|h| h.value.as_str().to_string());
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    Ok((method, target, headers))
+}
+
+/// One connection, one request, on a thread of its own: reads time out, and a body is read
+/// only after the rule and the secret are checked, and only as far as its 64 KiB cap.
+fn serve_one(cfg: &Config, secret: &str, stream: TcpStream) {
+    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    let mut reader = BufReader::new(&stream);
+    let (method, target, headers) = match read_head(&mut reader) {
+        Ok(h) => h,
+        Err(status) => {
+            respond(
+                &stream,
+                reply(status, json!({"error": "could not read the request"})),
+            );
+            return;
+        }
+    };
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let length = match (header("transfer-encoding"), header("content-length")) {
+        (Some(_), _) => {
+            respond(
+                &stream,
+                reply(
+                    411,
+                    json!({"error": "send a Content-Length, not a chunked body"}),
+                ),
+            );
+            return;
+        }
+        (None, None) => 0,
+        (None, Some(v)) => match v.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                respond(&stream, reply(400, json!({"error": "bad Content-Length"})));
+                return;
+            }
+        },
+    };
+    let mut body = reader.take(length.min(MAX_BODY as u64 + 1));
     let store = match Store::open(&cfg.db_path()) {
         Ok(s) => s,
         Err(e) => {
-            respond(req, reply(500, json!({"error": format!("{e:#}")})));
+            respond(&stream, reply(500, json!({"error": format!("{e:#}")})));
             return;
         }
     };
@@ -137,19 +227,34 @@ fn serve_one(cfg: &Config, secret: &str, mut req: tiny_http::Request) {
         crate::daemon::queue_event(&store, rule, "webhook", &fields, None)?
             .ok_or_else(|| anyhow!("the event was not stored"))
     };
-    let r = handle(
-        cfg,
-        secret,
-        &method,
-        &url,
-        auth.as_deref(),
-        req.as_reader(),
-        &mut queue,
-    );
+    let r = if length > MAX_BODY as u64 {
+        reply(413, json!({"error": "body over 64 KiB"}))
+    } else {
+        handle(
+            cfg,
+            secret,
+            &method,
+            &target,
+            header("authorization"),
+            &mut body,
+            &mut queue,
+        )
+    };
     if r.status == 401 {
-        crate::daemon::say(&format!("webhook {url}: refused, wrong or missing secret"));
+        crate::daemon::say(&format!(
+            "webhook {target}: refused, wrong or missing secret"
+        ));
     }
-    respond(req, r);
+    respond(&stream, r);
+}
+
+/// Counts a request while it is served, however its thread ends.
+struct Busy(Arc<AtomicUsize>);
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Starts the listener; it serves until `stop` is set.
@@ -164,28 +269,36 @@ pub fn serve(cfg: Arc<Config>, stop: &'static AtomicBool) -> Result<Option<JoinH
     {
         return Ok(None);
     }
-    let server = tiny_http::Server::http(&wh.listen)
+    let listener = TcpListener::bind(&wh.listen)
         .map_err(|e| anyhow!("webhook listener on {}: {e}", wh.listen))?;
+    listener.set_nonblocking(true)?;
     let busy = Arc::new(AtomicUsize::new(0));
     let handle = std::thread::spawn(move || {
         while !stop.load(Ordering::SeqCst) {
-            let req = match server.recv_timeout(Duration::from_millis(300)) {
-                Ok(Some(r)) => r,
-                Ok(None) => continue,
+            let stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
                 Err(e) => {
                     crate::daemon::say(&format!("webhook listener: {e}"));
+                    std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
             };
-            if busy.fetch_add(1, Ordering::SeqCst) >= MAX_REQUESTS {
-                busy.fetch_sub(1, Ordering::SeqCst);
-                respond(req, reply(503, json!({"error": "busy, try again"})));
-                continue;
-            }
-            let (cfg, secret, busy) = (cfg.clone(), wh.secret.clone(), busy.clone());
+            let _ = stream.set_nonblocking(false);
+            let guard = Busy(busy.clone());
+            let full = busy.fetch_add(1, Ordering::SeqCst) >= MAX_REQUESTS;
+            let (cfg, secret) = (cfg.clone(), wh.secret.clone());
             std::thread::spawn(move || {
-                serve_one(&cfg, &secret, req);
-                busy.fetch_sub(1, Ordering::SeqCst);
+                let _guard = guard;
+                if full {
+                    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+                    respond(&stream, reply(503, json!({"error": "busy, try again"})));
+                } else {
+                    serve_one(&cfg, &secret, stream);
+                }
             });
         }
     });
@@ -248,6 +361,38 @@ mod tests {
         assert_eq!(call(&c, "GET", "/health", None, ""), (200, 0));
         let big = "x".repeat(MAX_BODY + 1);
         assert_eq!(call(&c, "POST", "/hooks/form", ok, &big), (413, 0));
+    }
+
+    /// Sends raw bytes to serve_one and returns the reply's status line, without the client
+    /// ever sending the body it announced.
+    fn exchange(c: &Config, request: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let c = c.clone();
+        let t = std::thread::spawn(move || serve_one(&c, "0123456789abcdef", server));
+        client.write_all(request.as_bytes()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut out = String::new();
+        let _ = client.read_to_string(&mut out);
+        t.join().unwrap();
+        out.lines().next().unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn announced_bodies_are_not_waited_for_or_drained() {
+        let c = cfg();
+        let start = std::time::Instant::now();
+        let huge = "POST /hooks/form HTTP/1.1\r\nContent-Length: 100000000000000000\r\n\r\n";
+        assert_eq!(exchange(&c, huge), "HTTP/1.1 413 Payload Too Large");
+        let stalled = "POST /hooks/form HTTP/1.1\r\nContent-Length: 5000\r\n\r\n";
+        assert_eq!(exchange(&c, stalled), "HTTP/1.1 401 Unauthorized");
+        let chunked = "POST /hooks/form HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert_eq!(exchange(&c, chunked), "HTTP/1.1 411 Length Required");
+        assert!(start.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

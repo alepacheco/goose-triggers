@@ -241,9 +241,10 @@ pub fn approve(cfg: &Config, run: i64, yes: bool) -> Result<()> {
     refuse_inside_a_run()?;
     let store = open(cfg)?;
     let Some(shown) = store.pending_call(run)? else {
-        // Let the store say why (no such run, not held).
-        store.approve(run)?;
-        return Ok(());
+        match store.run(run)? {
+            None => bail!("there is no run {run}"),
+            Some(r) => bail!("run {run} is {}, not held", r.state),
+        }
     };
     println!("run {run} waits on {} with input", clean(&shown.tool_name));
     println!("{}", indent(&full_call(&shown.tool_input), "  "));

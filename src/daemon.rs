@@ -41,14 +41,19 @@ fn our_goose(pid: i64, run: i64) -> bool {
 }
 
 /// After an unclean stop, a goose that goose-triggers started may still be winding down
-/// (it got SIGINT when goose-triggers died): wait for it, then make sure it is gone.
+/// (it got SIGINT when goose-triggers died): wait for it, then make sure it and its process
+/// group are gone.
 fn wait_for_old_goose(pid: i64, run: i64) {
     let start = Instant::now();
     while our_goose(pid, run) {
         if start.elapsed() > Duration::from_secs(15) {
-            // SAFETY: the process is ours, as its environment shows.
+            // SAFETY: the process is ours, as its environment shows; its group is its pid.
             unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+            let killed = Instant::now();
+            while our_goose(pid, run) && killed.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(100));
             }
             return;
         }
@@ -266,10 +271,13 @@ pub fn run(cfg: Config) -> Result<()> {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
     }
 
-    for r in store.runs_in(state::RUNNING)? {
+    for r in store.runs_with_pid()? {
         if let Some(pid) = r.pid {
             wait_for_old_goose(pid, r.id);
         }
+        store.set_pid(r.id, None)?;
+    }
+    for r in store.runs_in(state::RUNNING)? {
         if store.has_open_permission(r.id)? {
             // A resumed run that had not made its approved call yet: resume it again.
             store.transition(r.id, &[state::RUNNING], state::APPROVED, None)?;
