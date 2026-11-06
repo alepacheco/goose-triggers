@@ -260,6 +260,16 @@ fn refuse_inside_a_run() -> Result<()> {
     Ok(())
 }
 
+/// A held call goose-triggers will not approve: `delegate` starts a subagent on a provider
+/// goose-triggers cannot check (the call's own `provider`, `GOOSE_SUBAGENT_PROVIDER`, its
+/// recipe's), which may be a CLI agent running its own tools where no hold sees them.
+fn approvable(tool: &str, run: i64) -> Result<()> {
+    if crate::store::matches_hold(&["*delegate".to_string()], tool) {
+        bail!("not approved: goose-triggers does not approve {tool}, which starts a subagent on a provider it cannot check (the call's own provider, GOOSE_SUBAGENT_PROVIDER or its recipe's), one that may run its own tools where no hold sees them. Reject it with goose-triggers reject {run}");
+    }
+    Ok(())
+}
+
 pub fn approve(cfg: &Config, run: i64, yes: bool) -> Result<()> {
     refuse_inside_a_run()?;
     let store = open(cfg)?;
@@ -271,6 +281,7 @@ pub fn approve(cfg: &Config, run: i64, yes: bool) -> Result<()> {
     };
     say!("run {run} waits on {} with input", clean(&shown.tool_name));
     say!("{}", indent(&full_call(&shown.tool_input), "  "));
+    approvable(&shown.tool_name, run)?;
     // SAFETY: isatty only inspects a file descriptor.
     let interactive = unsafe { libc::isatty(0) } == 1;
     if !interactive && !yes {
@@ -321,6 +332,14 @@ pub fn reject(cfg: &Config, run: i64) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_delegate_call_is_never_approved() {
+        assert!(approvable("delegate", 3).is_err());
+        assert!(approvable("subagent__delegate", 3).is_err());
+        assert!(approvable("shell", 3).is_ok());
+        assert!(approvable("write", 3).is_ok());
+    }
 
     #[test]
     fn full_call_is_whole_and_terminal_safe() {

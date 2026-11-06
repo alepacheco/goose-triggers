@@ -96,9 +96,6 @@ pub fn spawn(ctx: Ctx, run: Run, mode: Mode) -> JoinHandle<()> {
 /// then the user's `config.yaml`, a later file's setting winning); then `GOOSE_PROVIDER` from
 /// those files.
 pub fn goose_default_provider() -> Option<String> {
-    if let Ok(p) = std::env::var("GOOSE_PROVIDER") {
-        return Some(p);
-    }
     let mut files = vec![PathBuf::from("/etc/goose/config.yaml")];
     if let Some(list) = std::env::var_os("GOOSE_ADDITIONAL_CONFIG_FILES") {
         files.extend(std::env::split_paths(&list));
@@ -108,12 +105,29 @@ pub fn goose_default_provider() -> Option<String> {
         .iter()
         .filter_map(|f| std::fs::read_to_string(f).ok())
         .collect();
-    match std::env::var("ACTIVE_PROVIDER") {
-        Err(_) => provider_in_goose_configs(&layers, true),
-        Ok(v) => match active_provider_env(&v) {
+    default_provider_from(
+        std::env::var("GOOSE_PROVIDER").ok(),
+        std::env::var("ACTIVE_PROVIDER").ok(),
+        &layers,
+    )
+}
+
+/// `goose_default_provider` from the values of `GOOSE_PROVIDER` and `ACTIVE_PROVIDER` and the
+/// texts of goose's config files.
+fn default_provider_from(
+    goose_provider: Option<String>,
+    active_provider: Option<String>,
+    layers: &[String],
+) -> Option<String> {
+    if let Some(p) = goose_provider {
+        return Some(p);
+    }
+    match active_provider {
+        None => provider_in_goose_configs(layers, true),
+        Some(v) => match active_provider_env(&v) {
             Some(name) => Some(name),
             // goose's get_param fails on it and does not read the files' active_provider.
-            None => provider_in_goose_configs(&layers, false),
+            None => provider_in_goose_configs(layers, false),
         },
     }
 }
@@ -155,32 +169,56 @@ fn provider_in_goose_configs(layers: &[String], with_active: bool) -> Option<Str
     })
 }
 
+/// Where a provider goose may use comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderFrom {
+    Rule,
+    Recipe,
+    /// goose's default provider, which goose falls back to on a resume.
+    Default,
+}
+
 /// The providers goose may run a rule's runs on. A provider the rule names is passed to goose
 /// as `--provider`, at the start and at every resume, and goose uses only that. Otherwise goose
 /// starts on the recipe's (else its default), and when it resumes a run whose provider it
 /// cannot set up again (a key that is no longer set), it goes on with its default provider:
 /// both count.
-pub fn providers_goose_may_use(rule: Option<&str>, recipe: Option<String>) -> Vec<String> {
+pub fn providers_goose_may_use(
+    rule: Option<&str>,
+    recipe: Option<String>,
+) -> Vec<(String, ProviderFrom)> {
+    providers_from(rule, recipe, goose_default_provider)
+}
+
+fn providers_from(
+    rule: Option<&str>,
+    recipe: Option<String>,
+    default: impl FnOnce() -> Option<String>,
+) -> Vec<(String, ProviderFrom)> {
     match rule {
-        Some(p) => vec![p.to_string()],
-        None => recipe.into_iter().chain(goose_default_provider()).collect(),
+        Some(p) => vec![(p.to_string(), ProviderFrom::Rule)],
+        None => recipe
+            .map(|p| (p, ProviderFrom::Recipe))
+            .into_iter()
+            .chain(default().map(|p| (p, ProviderFrom::Default)))
+            .collect(),
     }
 }
 
 /// Refuses a rule with holds that goose may run on a CLI-agent provider.
-pub fn check_providers(providers: &[String]) -> Result<()> {
-    let Some(p) = providers.iter().find(|p| is_cli_agent_provider(p)) else {
+pub fn check_providers(providers: &[(String, ProviderFrom)]) -> Result<()> {
+    let Some((p, from)) = providers.iter().find(|(p, _)| is_cli_agent_provider(p)) else {
         return Ok(());
     };
     let why = "hands runs to another agent, which runs its own tools: goose's hooks do not see those calls, so the rule's holds could not be enforced";
-    if providers.len() > 1 && providers.last() == Some(p) {
-        bail!(
-            "goose's default provider {p} {why}; goose falls back to it when it resumes a run whose own provider it cannot set up again (a key no longer set). Name the rule's provider on the rule (provider:), which goose-triggers passes to goose at every start and resume, or make goose's default a provider for which goose runs the tools"
-        );
+    match from {
+        ProviderFrom::Default => bail!(
+            "goose's default provider {p} {why}; goose uses it when neither the rule nor the recipe names a provider, and falls back to it when it resumes a run whose own provider it cannot set up again (a key no longer set). Name a provider for which goose runs the tools (an API provider or a local model) on the rule (provider:), which goose-triggers passes to goose at every start and resume, or make goose's default one"
+        ),
+        _ => bail!(
+            "provider {p} {why}. Use a provider for which goose runs the tools (an API provider or a local model)"
+        ),
     }
-    bail!(
-        "provider {p} {why}. Use a provider for which goose runs the tools (an API provider or a local model)"
-    )
 }
 
 fn check_provider(run: &Run) -> Result<()> {
@@ -925,6 +963,22 @@ mod tests {
     }
 
     #[test]
+    fn reads_goose_default_provider_in_goose_order() {
+        let files = [
+            "active_provider: openai\n".to_string(),
+            "GOOSE_PROVIDER: claude-code\n".to_string(),
+        ];
+        let d = |g: Option<&str>, a: Option<&str>| {
+            default_provider_from(g.map(str::to_string), a.map(str::to_string), &files)
+        };
+        assert_eq!(d(Some("ollama"), Some("x")).as_deref(), Some("ollama"));
+        assert_eq!(d(None, Some("anthropic")).as_deref(), Some("anthropic"));
+        assert_eq!(d(None, None).as_deref(), Some("openai"));
+        // ACTIVE_PROVIDER that names no provider: goose goes to GOOSE_PROVIDER in the files.
+        assert_eq!(d(None, Some("1")).as_deref(), Some("claude-code"));
+    }
+
+    #[test]
     fn when_active_provider_is_not_a_name_only_goose_provider_counts() {
         // goose's get_param fails on ACTIVE_PROVIDER=1 and does not read the files'
         // active_provider; it takes GOOSE_PROVIDER from them.
@@ -951,12 +1005,37 @@ mod tests {
     fn a_rule_with_no_provider_is_refused_when_goose_may_fall_back_to_a_cli_agent() {
         // The recipe names an API provider, goose's default is a CLI agent: goose falls back to
         // the default when it resumes a run whose provider it cannot set up again.
-        let e = check_providers(&["anthropic".into(), "cursor-agent".into()]).unwrap_err();
-        assert!(format!("{e}").contains("cursor-agent"), "{e}");
+        let cli_default = || Some("cursor-agent".to_string());
+        let may = providers_from(None, Some("anthropic".into()), cli_default);
+        assert_eq!(
+            may,
+            [
+                ("anthropic".to_string(), ProviderFrom::Recipe),
+                ("cursor-agent".to_string(), ProviderFrom::Default)
+            ]
+        );
+        let e = check_providers(&may).unwrap_err();
+        assert!(
+            format!("{e}").contains("default provider cursor-agent"),
+            "{e}"
+        );
         assert!(format!("{e}").contains("on the rule (provider:)"), "{e}");
-        assert!(check_providers(&["claude-code".into()]).is_err());
-        assert!(check_providers(&["anthropic".into(), "openai".into()]).is_ok());
-        assert!(check_providers(&["ollama".into()]).is_ok());
+        // The default alone, with nothing named: said to be goose's default too.
+        let e = check_providers(&providers_from(None, None, cli_default)).unwrap_err();
+        assert!(
+            format!("{e}").contains("default provider cursor-agent"),
+            "{e}"
+        );
+        // A provider named on the rule is the only one goose uses.
+        assert!(check_providers(&providers_from(Some("anthropic"), None, cli_default)).is_ok());
+        assert!(check_providers(&providers_from(Some("claude-code"), None, || None)).is_err());
+        assert!(check_providers(&providers_from(None, Some("codex".into()), || None)).is_err());
+        assert!(
+            check_providers(&providers_from(None, Some("anthropic".into()), || Some(
+                "openai".into()
+            )))
+            .is_ok()
+        );
         assert!(check_providers(&[]).is_ok());
     }
 
