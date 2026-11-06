@@ -67,19 +67,25 @@ const MISSING_PROVIDER: &str = "goose-triggers-selftest-missing";
 const SECRET_ENV: &str = "GOOSE_TRIGGERS_SELFTEST_SECRET";
 const WAIT: Duration = Duration::from_secs(90);
 
-struct Selftest {
-    dir: PathBuf,
-    exe: PathBuf,
-    config: PathBuf,
-    listen: String,
-    secret: String,
-    env: Vec<(String, String)>,
-    daemon: Option<Child>,
-    checks: usize,
+/// A goose-triggers under test: its config, environment and `run` daemon. Used by the
+/// selftest and the hostile-event suite.
+pub(crate) struct Harness {
+    pub(crate) dir: PathBuf,
+    pub(crate) exe: PathBuf,
+    pub(crate) config: PathBuf,
+    pub(crate) listen: String,
+    pub(crate) secret: String,
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) daemon: Option<Child>,
+    pub(crate) checks: usize,
 }
 
 /// Polls `f` every 200 ms until it gives a value, for at most `limit`.
-fn wait_for<T>(what: &str, limit: Duration, mut f: impl FnMut() -> Result<Option<T>>) -> Result<T> {
+pub(crate) fn wait_for<T>(
+    what: &str,
+    limit: Duration,
+    mut f: impl FnMut() -> Result<Option<T>>,
+) -> Result<T> {
     let start = Instant::now();
     loop {
         if let Some(v) = f()? {
@@ -92,12 +98,12 @@ fn wait_for<T>(what: &str, limit: Duration, mut f: impl FnMut() -> Result<Option
     }
 }
 
-fn free_port() -> Result<u16> {
+pub(crate) fn free_port() -> Result<u16> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
 /// A plain HTTP/1.1 request; returns the status and the body.
-fn http(
+pub(crate) fn http(
     addr: &str,
     method: &str,
     path: &str,
@@ -130,7 +136,7 @@ fn http(
     Ok((status, body))
 }
 
-impl Selftest {
+impl Harness {
     fn ok(&mut self, what: &str) {
         self.checks += 1;
         println!("  ok  {what}");
@@ -144,11 +150,11 @@ impl Selftest {
         Ok(())
     }
 
-    fn store(&self) -> Result<Store> {
+    pub(crate) fn store(&self) -> Result<Store> {
         Store::open(&self.dir.join("state/state.db"))
     }
 
-    fn command(&self, args: &[&str]) -> Command {
+    pub(crate) fn command(&self, args: &[&str]) -> Command {
         let mut c = Command::new(&self.exe);
         c.args(args).arg("--config").arg(&self.config);
         for (k, v) in &self.env {
@@ -159,7 +165,7 @@ impl Selftest {
     }
 
     /// Runs a goose-triggers command; returns its output, or fails with it.
-    fn cli(&self, args: &[&str]) -> Result<String> {
+    pub(crate) fn cli(&self, args: &[&str]) -> Result<String> {
         let out = self.command(args).output()?;
         let text = format!(
             "{}{}",
@@ -172,7 +178,7 @@ impl Selftest {
         Ok(text)
     }
 
-    fn start_daemon(&mut self) -> Result<()> {
+    pub(crate) fn start_daemon(&mut self) -> Result<()> {
         let log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -201,7 +207,7 @@ impl Selftest {
         Ok(())
     }
 
-    fn stop_daemon(&mut self) -> Result<()> {
+    pub(crate) fn stop_daemon(&mut self) -> Result<()> {
         let Some(mut d) = self.daemon.take() else {
             return Ok(());
         };
@@ -664,7 +670,7 @@ impl Selftest {
 }
 
 /// The writing end of a pipe whose reading end is closed already: every write to it fails.
-fn closed_pipe() -> Result<Stdio> {
+pub(crate) fn closed_pipe() -> Result<Stdio> {
     use std::os::fd::{FromRawFd, OwnedFd};
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: pipe2 fills both descriptors, which this process then owns; the reading end is
@@ -678,19 +684,24 @@ fn closed_pipe() -> Result<Stdio> {
     }
 }
 
-fn yaml_str(p: &Path) -> String {
+pub(crate) fn yaml_str(p: &Path) -> String {
     serde_json::to_string(&p.to_string_lossy()).unwrap_or_default()
 }
 
-pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
-    let goose = match goose {
+/// The goose binary given with --goose (a path made absolute), else `goose` on PATH.
+pub(crate) fn resolve_goose(goose: Option<PathBuf>) -> Result<String> {
+    Ok(match goose {
         Some(p) if p.components().count() > 1 => std::fs::canonicalize(&p)
             .with_context(|| format!("--goose {}", p.display()))?
             .to_string_lossy()
             .into_owned(),
         Some(p) => p.to_string_lossy().into_owned(),
         None => "goose".into(),
-    };
+    })
+}
+
+pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
+    let goose = resolve_goose(goose)?;
     let dir = std::env::temp_dir().join(format!(
         "goose-triggers-selftest-{}-{}",
         std::process::id(),
@@ -719,7 +730,7 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
     );
     println!("  in {}", dir.display());
 
-    let model = scripted_model::start(Duration::from_secs(30))?;
+    let model = scripted_model::start(Duration::from_secs(30), scripted_model::Script::Selftest)?;
     std::fs::write(dir.join("recipes/folder.yaml"), FOLDER_RECIPE)?;
     std::fs::write(dir.join("recipes/webhook.yaml"), WEBHOOK_RECIPE)?;
     let listen = format!("127.0.0.1:{}", free_port()?);
@@ -753,7 +764,7 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
     .map(|(k, v)| (k.to_string(), v))
     .collect();
 
-    let mut t = Selftest {
+    let mut t = Harness {
         exe: std::env::current_exe()?,
         config,
         listen,

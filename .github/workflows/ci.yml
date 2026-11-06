@@ -1,8 +1,9 @@
 name: CI
 
-# Unit tests and the end-to-end selftest against goose's latest CLI release and the release
-# goose-triggers was last checked with. The daily run tests each new goose release as it
-# comes out. The selftest uses goose-triggers' scripted model server: no API key, no secrets.
+# Unit tests, the end-to-end selftest and the hostile-event suite against goose's latest CLI
+# release and the release goose-triggers was last checked with. The daily run tests each new
+# goose release as it comes out. Both use goose-triggers' scripted model server: no API key,
+# no secrets.
 on:
   push:
     branches: [main]
@@ -67,6 +68,9 @@ jobs:
 
       - name: Selftest with the release binary
         run: target/x86_64-unknown-linux-musl/release/goose-triggers selftest
+
+      - name: Hostile-event suite with the release binary
+        run: target/x86_64-unknown-linux-musl/release/goose-triggers hostile-suite
 
   lint:
     if: github.event_name != 'schedule'

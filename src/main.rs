@@ -7,6 +7,7 @@ mod config;
 mod daemon;
 mod folder;
 mod hook;
+mod hostile;
 mod plugin;
 mod recipe;
 mod runner;
@@ -73,6 +74,15 @@ enum Cmd {
         #[arg(long)]
         keep: bool,
     },
+    /// Run hostile events (injected instructions in webhook fields and files) against the example rules' recipes, with no holds and with their holds, a scripted model obeying every injection; no API key needed
+    HostileSuite {
+        /// The goose binary to test with [default: goose on PATH]
+        #[arg(long, value_name = "PATH")]
+        goose: Option<PathBuf>,
+        /// Keep the suite's temporary folder even when every result is as expected
+        #[arg(long)]
+        keep: bool,
+    },
     /// Called by goose through goose-triggers' plugin hooks; not for direct use
     #[command(hide = true)]
     Hook,
@@ -104,6 +114,7 @@ fn main() -> ExitCode {
         Cmd::Reject { run } => config::Config::load_for_state(cli.config.as_deref())
             .and_then(|c| commands::reject(&c, run)),
         Cmd::Selftest { goose, keep } => selftest::run(goose, keep),
+        Cmd::HostileSuite { goose, keep } => hostile::run(goose, keep),
         Cmd::Hook => unreachable!(),
     };
     match result {

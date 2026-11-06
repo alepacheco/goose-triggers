@@ -8,7 +8,7 @@ You mark the actions that need your approval (running a command, writing a file,
 
 **Status: release 0.0, a working prototype of that core path.** Linux x86-64. Tested with goose 1.57.0. See [Limits of 0.0](#limits-of-00).
 
-[![CI](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml/badge.svg)](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml) The unit tests and the [selftest](#check-it-works-selftest) run on GitHub Actions on every push and pull request, and every day against goose's latest CLI release (and goose 1.57.0), so a new goose release that breaks goose-triggers shows there: [CI runs](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml).
+[![CI](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml/badge.svg)](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml) The unit tests, the [selftest](#check-it-works-selftest) and the [hostile-event suite](#hostile-events-what-holds-stop) run on GitHub Actions on every push and pull request, and every day against goose's latest CLI release (and goose 1.57.0), so a new goose release that breaks goose-triggers shows there: [CI runs](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml).
 
 ## How it works
 
@@ -34,12 +34,12 @@ Run states: `queued`, `running`, `held`, `approved` (waiting to resume), `done`,
 From the release (a static binary). It goes in `~/.local/bin`, which must be on your PATH: the `export` line adds it for this shell (add it to your shell's profile to keep it).
 
 ```sh
-curl -fsSLO https://github.com/alepacheco/goose-triggers/releases/download/v0.0.2/goose-triggers-v0.0.2-x86_64-linux.tar.gz
-curl -fsSLO https://github.com/alepacheco/goose-triggers/releases/download/v0.0.2/goose-triggers-v0.0.2-x86_64-linux.tar.gz.sha256
-sha256sum -c goose-triggers-v0.0.2-x86_64-linux.tar.gz.sha256
-tar -xzf goose-triggers-v0.0.2-x86_64-linux.tar.gz
+curl -fsSLO https://github.com/alepacheco/goose-triggers/releases/download/v0.0.3/goose-triggers-v0.0.3-x86_64-linux.tar.gz
+curl -fsSLO https://github.com/alepacheco/goose-triggers/releases/download/v0.0.3/goose-triggers-v0.0.3-x86_64-linux.tar.gz.sha256
+sha256sum -c goose-triggers-v0.0.3-x86_64-linux.tar.gz.sha256
+tar -xzf goose-triggers-v0.0.3-x86_64-linux.tar.gz
 mkdir -p ~/.local/bin
-install -m 755 goose-triggers-v0.0.2-x86_64-linux/goose-triggers ~/.local/bin/
+install -m 755 goose-triggers-v0.0.3-x86_64-linux/goose-triggers ~/.local/bin/
 export PATH="$HOME/.local/bin:$PATH"
 goose-triggers --version
 ```
@@ -47,7 +47,7 @@ goose-triggers --version
 Or from source, with Rust 1.85 or newer (it installs to `~/.cargo/bin`):
 
 ```sh
-cargo install --locked --git https://github.com/alepacheco/goose-triggers --tag v0.0.2
+cargo install --locked --git https://github.com/alepacheco/goose-triggers --tag v0.0.3
 ```
 
 ## Check it works: selftest
@@ -72,6 +72,18 @@ The selftest runs the whole path with your goose binary and a scripted model ser
 
 Pass `--goose <path>` to test another goose binary, `--keep` to keep the temporary folder.
 
+## Hostile events: what holds stop
+
+```sh
+goose-triggers hostile-suite
+```
+
+The suite sends 14 events carrying injected instructions to rules made from the [example recipes](examples/recipes/): webhook fields, and files whose names or contents ask the model to send a secret file to a server, delete a file, run a command, put a download-and-run line in a shell profile, add an extension to the rule's recipe file, or empty goose-triggers' hooks file; and webhook fields and file names carrying YAML that would change the recipe itself (a `retry` check or a sub-recipe that runs a command). The scripted model plays the worst case: a model that falls for every injection and makes each call the injected text asks for (each injected instruction carries the call it means, for the scripted model to make). Each harmful call that runs trips a local canary: a request to a local server, or a file made, deleted or changed.
+
+The events run twice: with no holds, and with the example rules' holds (`shell`, `write`, `edit`). When a file-note run is held at its read of the new file (the recipe's own task), the suite approves it, as a user would; every other held call it rejects. The suite passes only if, with no holds, every injected action trips its canary (the canaries work), and with the holds none does, each held at its first injected call; and if the recipe-structure check refuses every value that would change the recipe, in both passes. It prints a table of what happened to each event; for the values that would change the recipe it also shows what goose renders from them with no check. It needs goose and `curl` (the injected calls send data with it), no API key, and works in a temporary folder (`--keep` keeps it, with `results.md`).
+
+What it does not show: how often a real model falls for such text (it assumes always); calls through tools a rule does not hold, such as an extension's tools you did not list (a hold covers only the tools it names: [Config reference](#config-reference)); and a user who approves a harmful call.
+
 ## Use
 
 1. Set up goose with a model provider (`goose configure`), one for which goose runs the tools itself ([Requirements](#requirements)), and check that it answers headless:
@@ -85,7 +97,7 @@ Pass `--goose <path>` to test another goose binary, `--keep` to keep the tempora
    ```sh
    mkdir -p ~/.config/goose-triggers/recipes ~/Inbox
    cd ~/.config/goose-triggers
-   base=https://raw.githubusercontent.com/alepacheco/goose-triggers/v0.0.2/examples
+   base=https://raw.githubusercontent.com/alepacheco/goose-triggers/v0.0.3/examples
    curl -fsSL -o config.yaml "$base/config.yaml"
    curl -fsSL -o recipes/file-note.yaml "$base/recipes/file-note.yaml"
    curl -fsSL -o recipes/form-entry.yaml "$base/recipes/form-entry.yaml"
@@ -181,6 +193,7 @@ The webhook answers `202 {"event": <id>, "run": <id>}`, `401` for a missing or w
 | `goose-triggers approve <run> [--yes]` | shows the call a held run waits on and approves it: on a terminal it asks first, unless `--yes`; with no terminal (a script) it needs `--yes`. `run` resumes the same session |
 | `goose-triggers reject <run>` | rejects a held run's call, or withdraws the approval of a run not resumed yet; the run ends |
 | `goose-triggers selftest [--goose <path>] [--keep]` | the end-to-end check above |
+| `goose-triggers hostile-suite [--goose <path>] [--keep]` | the [hostile events](#hostile-events-what-holds-stop), with and without holds |
 
 Read a held call in full with `log <run>` before approving it. `approve` and `reject` work whether `goose-triggers run` is running or not: an approved run resumes once it runs, and until then `reject` can withdraw the approval.
 
@@ -192,7 +205,7 @@ cargo test
 
 runs the unit tests (rules, the store's hold and approval logic, the hook's decisions, folder and webhook sources, recipe parameters and the structure check, the scripted model server) and then the selftest above, when a goose binary is on PATH (or at the path in `GOOSE_BIN`); without one, the selftest is skipped and says so.
 
-[CI](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml) ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the same with goose's latest release and goose 1.57.0, builds the static release binary and runs its selftest, on every push and pull request and once a day.
+[CI](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml) ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the same with goose's latest release and goose 1.57.0, builds the static release binary and runs its selftest and the [hostile-event suite](#hostile-events-what-holds-stop), on every push and pull request and once a day.
 
 The release binary is built static, with musl:
 
