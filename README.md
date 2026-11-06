@@ -11,7 +11,7 @@ You mark the actions that need your approval (running a command, writing a file,
 ## How it works
 
 - A **rule** names an event source (a folder and a file-name pattern, or a webhook), a goose **recipe**, and the tools to **hold**.
-- Each event becomes a **run**: `goose run --recipe <recipe> --params <field>=<value> ... --output-format stream-json`, headless, in the rule's working folder. The event's fields are passed as the recipe's parameters of the same names.
+- Each event becomes a **run**: `goose run --recipe <recipe> --params <field>=<value> ... --quiet --output-format stream-json`, headless, in the rule's working folder. The event's fields are passed as the recipe's parameters of the same names.
 - goose fills parameters into the recipe's text before it reads the recipe, so a value carrying YAML or JSON syntax could add to the recipe itself (an extension, a retry command) rather than fill in its text. Before each new run, goose-triggers has goose render the recipe twice, with the event's values and with placeholders, and starts the run only if the two have the same structure and the values fill in nothing but the recipe's text fields (`prompt`, `instructions`, `title`, `description`, `activities`, `author`): no value can choose an extension, a command or the provider. goose runs with its slash commands off (`GOOSE_SLASH_COMMANDS_ENABLED=false`), so an event's text cannot start one of your slash-command recipes either. File parameters (`input_type: file`, whose file goose pastes into the recipe) are not filled from events.
 - goose-triggers writes its own goose plugin into each rule's working folder (`.agents/plugins/goose-triggers/`). goose loads it when the run starts there. Its `PreToolUse` hook calls `goose-triggers hook`, which allows the call, or holds it when the tool matches the rule's `hold` list. Its `SessionStart` hook records the run's goose session. The hook does nothing in goose sessions that goose-triggers did not start.
 - On a hold, the hook denies the call with a reason and stores it in goose-triggers' SQLite store; the run becomes `held`, every further call in it is denied, and goose-triggers stops goose as soon as goose has recorded the denial. It stops goose with SIGINT, as Ctrl-C would: goose cancels its turn, stops the commands it started and saves the session.
@@ -63,7 +63,8 @@ The selftest runs the whole path with your goose binary and a scripted model ser
 5. `approve` resumes the first run in the same goose session, the approved call runs once, and the run is done;
 6. `approve` on the second run resumes it, its model makes a different call, which is held again; `reject` ends the run, and no held call ran;
 7. a webhook event whose value carries YAML that would add a command to the recipe is refused before goose runs anything;
-8. a run that goose fails (its rule names a provider goose does not have) is marked failed with goose's own reason, and none of the event's values in it.
+8. a run that goose fails (its rule names a provider goose does not have) is marked failed with goose's own reason, and none of the event's values in it;
+9. an event whose value breaks the recipe's YAML, and one that lacks the recipe's parameter, fail before goose runs, with reasons that quote none of the sender's text.
 
 Pass `--goose <path>` to test another goose binary, `--keep` to keep the temporary folder.
 
@@ -201,7 +202,7 @@ cargo build --locked --release --target x86_64-unknown-linux-musl
 - You decide on holds from the command line; there are no notifications yet. The config is read when `goose-triggers run` starts.
 - The hold depends on goose loading goose-triggers' plugin from the working folder. Before each run, goose-triggers rewrites the plugin and checks goose's settings for a disabled one. If goose runs a tool the hook did not see, the run is stopped and marked failed, but that tool has already run.
 - A run stopped while it is going (goose-triggers stopped, or goose failed) is marked failed and not retried, except a resumed run that had not yet made its approved call: it resumes again.
-- A run has no time limit of its own. `max_turns` on a rule bounds the model's turns, not time: a tool call that hangs keeps its run going, and one of the `max_concurrent_runs` places taken, until goose-triggers is stopped.
+- A run has no time limit of its own. `max_turns` on a rule bounds the model's turns, not time. goose ends a tool call after its timeout (300 seconds by default; a shell call may ask for a longer one, or for none), so a long run keeps one of the `max_concurrent_runs` places until it ends or goose-triggers is stopped.
 - goose is stopped with SIGINT. If it has not stopped 5 seconds later it gets SIGTERM and then SIGKILL, and a command it had started may then keep running.
 - Event values and approved calls go to goose on its command line, which other users of the machine can see in the process list.
 - A value that only fills in text is checked by its place in the recipe, not by what it says: a rule's recipe still reads event content, which may carry instructions for the model. That is what holds are for.

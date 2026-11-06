@@ -96,15 +96,11 @@ pub fn params_for(
         }
     }
     if !missing.is_empty() {
-        let have: Vec<&str> = fields.keys().map(String::as_str).collect();
+        // Only the recipe's own names: the event's field names are the sender's text
+        // (`goose-triggers log <run>` shows the event).
         bail!(
-            "the recipe needs parameter(s) {} that the event does not have (its fields: {})",
-            missing.join(", "),
-            if have.is_empty() {
-                "none".to_string()
-            } else {
-                have.join(", ")
-            }
+            "the recipe needs parameter(s) {} that the event does not have",
+            missing.join(", ")
         );
     }
     Ok(out)
@@ -124,13 +120,11 @@ pub fn check_values_stay_text(
     wd: &Path,
     hide_env: Option<&str>,
 ) -> Result<serde_yaml_ng::Value> {
-    let real = render(goose, recipe, params, wd, hide_env).map_err(|e| {
-        anyhow::anyhow!(
-            "with the event's values, goose cannot read the recipe ({e:#}); the run was not started"
-        )
-    })?;
+    let real = render(goose, recipe, params, wd, hide_env);
     if params.is_empty() {
-        return Ok(real);
+        return real.map_err(|e| {
+            anyhow::anyhow!("goose cannot read the recipe ({e:#}); the run was not started")
+        });
     }
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -143,8 +137,16 @@ pub fn check_values_stay_text(
         tokens.push((t.clone(), v.clone()));
         placeholders.push((k.clone(), t));
     }
-    let template = render(goose, recipe, &placeholders, wd, hide_env)
-        .context("goose could not render the recipe with placeholder values")?;
+    // goose's errors may quote the values (a YAML type error quotes the string), so a
+    // failure is told in goose's words only from the render with placeholders.
+    let template = render(goose, recipe, &placeholders, wd, hide_env).map_err(|e| {
+        anyhow::anyhow!(
+            "goose cannot read the recipe, even with placeholder values ({e:#}); the run was not started"
+        )
+    })?;
+    let Ok(real) = real else {
+        bail!("with the event's values goose cannot read the recipe, which it reads with other values: a value carries YAML or JSON syntax that breaks it; the run was not started");
+    };
     if !same_recipe(&real, &template, &tokens) {
         bail!("the event's values would change the recipe itself, not only fill in its text (a value carries YAML or JSON syntax, or fills in a field other than {}); the run was not started", TEXT_FIELDS.join(", "));
     }
@@ -422,7 +424,12 @@ prompt: "{{ file_path }} {{ note }} {{ who }}"
             ]
         );
         fields.remove("who");
+        fields.insert("Your key was revoked, see evil.example".into(), "1".into());
         let err = params_for(&info, &fields).unwrap_err().to_string();
-        assert!(err.contains("who") && err.contains("file_path"), "{err}");
+        // It names the recipe's missing parameter, never the event's own field names.
+        assert!(
+            err.contains("who") && !err.contains("extra") && !err.contains("evil.example"),
+            "{err}"
+        );
     }
 }

@@ -4,7 +4,8 @@
 //! there -> approve -> the same goose session resumes -> the approved call runs -> done;
 //! approve -> a differing call is held again -> reject -> the run ends, nothing ran;
 //! an event whose value would add a command to the recipe -> refused before goose runs;
-//! a run goose fails -> failed with goose's own reason, none of the event's values in it.
+//! a run goose fails -> failed with goose's own reason, none of the event's values in it;
+//! events refused before goose runs -> their reasons quote none of the sender's text.
 //! Everything happens in a temporary folder, with goose's own folders there too
 //! (`GOOSE_PATH_ROOT`), so the user's goose settings and sessions are not touched.
 
@@ -465,14 +466,62 @@ impl Selftest {
             )
         })?;
         let error = r.error.unwrap_or_default();
+        // goose printed none of the event's values either (it runs with --quiet).
+        let printed = ["jsonl", "stderr"].iter().any(|ext| {
+            std::fs::read_to_string(self.dir.join(format!("state/runs/{fail_run}.{ext}")))
+                .is_ok_and(|t| t.contains(value))
+        });
         self.check(
             r.state == state::FAILED
                 && error.starts_with("goose exited with")
                 && error.contains(MISSING_PROVIDER)
-                && !error.contains(value),
+                && !error.contains(value)
+                && !printed,
             &format!(
-                "run {fail_run}: goose failed (provider {MISSING_PROVIDER}); the run says why in goose's words, without the event's values: {}",
+                "run {fail_run}: goose failed (provider {MISSING_PROVIDER}); the run says why in goose's words, and neither it nor goose's output holds the event's values: {}",
                 crate::util::short(&error, 160)
+            ),
+        )?;
+
+        // Events refused before goose starts are not quoted either: a value that breaks the
+        // recipe's YAML (goose's error would quote it), and field names the sender chose.
+        let chosen = "CHOSEN-TEXT-9";
+        let breaking = format!("A-9\"\nsettings: {chosen}\nx: \"");
+        let mut refused = Vec::new();
+        for body in [
+            json!({ "order": breaking }),
+            json!({ chosen: "1", "note": "no order" }),
+        ] {
+            let (st, reply) = http(
+                &self.listen,
+                "POST",
+                &format!("/hooks/{WEBHOOK_RULE}"),
+                Some(&secret),
+                &body.to_string(),
+            )?;
+            let run = serde_json::from_str::<serde_json::Value>(&reply)
+                .ok()
+                .and_then(|v| v["run"].as_i64())
+                .filter(|_| st == 202)
+                .with_context(|| format!("webhook answered {st} {reply}"))?;
+            let r = wait_for("a refused event's run to fail", WAIT, || {
+                let r = self.store()?.run(run)?.context("run gone")?;
+                Ok(
+                    ([state::FAILED, state::DONE, state::HELD].contains(&r.state.as_str())
+                        && r.pid.is_none())
+                    .then_some(r),
+                )
+            })?;
+            refused.push((run, r.state, r.session_id, r.error.unwrap_or_default()));
+        }
+        self.check(
+            refused.iter().all(|(_, st, sid, e)| {
+                st == state::FAILED && sid.is_none() && !e.is_empty() && !e.contains(chosen)
+            }) && refused[0].3.contains("breaks it")
+                && refused[1].3.contains("parameter(s) order"),
+            &format!(
+                "runs {} and {}: an event whose value breaks the recipe, and one without its parameter, failed before goose ran, their reasons without the sender's text",
+                refused[0].0, refused[1].0
             ),
         )?;
 

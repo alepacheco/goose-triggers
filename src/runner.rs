@@ -684,7 +684,8 @@ fn finish(
     }
     if let Some(call) = &w.unseen_call {
         return fail(&format!(
-            "goose ran a tool (call {call}) that goose-triggers' hook never saw, so nothing could be held; the run was stopped. Check that goose loads plugins from {}",
+            "goose ran a tool (call {}) that goose-triggers' hook never saw, so nothing could be held; the run was stopped. Check that goose loads plugins from {}",
+            short(call, 80),
             wd.join(".agents/plugins").display()
         ));
     }
@@ -853,6 +854,21 @@ mod tests {
         let long = vec![format!("error: {}", "x".repeat(1000))];
         let r = failure_reason(&said, &long).unwrap();
         assert!(r.starts_with("error: xxx") && r.chars().count() == REASON_MAX);
+    }
+
+    #[test]
+    fn a_tool_response_after_goose_s_text_is_read() {
+        let line = r#"Yes — what would you like me to do?{"type":"message","message":{"role":"user","content":[{"type":"toolResponse","id":"c1","toolResult":{"status":"success","value":{"isError":false}}}]}}"#;
+        let (text, event) = split_line(line);
+        assert_eq!(text, "Yes — what would you like me to do?");
+        assert_eq!(
+            tool_responses(&event.unwrap()),
+            vec![ToolResponse {
+                id: "c1".into(),
+                success: true,
+                is_error: false
+            }]
+        );
     }
 
     #[test]
