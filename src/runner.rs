@@ -101,6 +101,12 @@ pub fn effective_provider(run: &Run) -> Option<String> {
     {
         return Some(p);
     }
+    goose_default_provider()
+}
+
+/// The provider goose uses when neither the rule nor the recipe names one: `GOOSE_PROVIDER`,
+/// else the one goose's own config sets.
+pub fn goose_default_provider() -> Option<String> {
     if let Some(p) = std::env::var("GOOSE_PROVIDER")
         .ok()
         .filter(|p| !p.is_empty())
@@ -109,7 +115,12 @@ pub fn effective_provider(run: &Run) -> Option<String> {
     }
     let text =
         std::fs::read_to_string(crate::plugin::goose_config_dir().join("config.yaml")).ok()?;
-    let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).ok()?;
+    provider_in_goose_config(&text)
+}
+
+/// The provider goose's config file (its text) sets.
+fn provider_in_goose_config(text: &str) -> Option<String> {
+    let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(text).ok()?;
     ["active_provider", "GOOSE_PROVIDER"]
         .iter()
         .find_map(|k| v.get(*k).and_then(|p| p.as_str()).map(str::to_string))
@@ -690,7 +701,19 @@ fn failure_reason(said: &Said, stderr: &[String]) -> Option<String> {
         .clone()
         .or_else(|| error_lines(&said.lines))
         .or_else(|| error_lines(stderr))
-        .map(|r| short(&r, REASON_MAX))
+        .map(|r| short(&reason_text(&r), REASON_MAX))
+}
+
+/// goose's error as one line of a reason: the line breaks some providers' messages carry
+/// escaped (`\n`) made spaces, and no full stop at the end, as the reason goes on after it.
+fn reason_text(error: &str) -> String {
+    let one_line = error
+        .replace("\\r\\n", " ")
+        .replace("\\n", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    one_line.trim_end_matches('.').to_string()
 }
 
 /// The last `n` lines that are not empty of what a file holds from byte `from` on, read from
@@ -804,7 +827,7 @@ fn finish(
         w.status,
         w.said
             .error
-            .map(|e| format!(": {}", short(&e, REASON_MAX)))
+            .map(|e| format!(": {}", short(&reason_text(&e), REASON_MAX)))
             .unwrap_or_default()
     ))
 }
@@ -813,6 +836,21 @@ fn finish(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reads_the_provider_goose_config_sets() {
+        assert_eq!(
+            provider_in_goose_config("GOOSE_PROVIDER: claude-code\nGOOSE_MODEL: x\n").as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(
+            provider_in_goose_config("active_provider: ollama\nGOOSE_PROVIDER: openai\n")
+                .as_deref(),
+            Some("ollama")
+        );
+        assert_eq!(provider_in_goose_config("GOOSE_MODEL: x\n"), None);
+        assert_eq!(provider_in_goose_config(": not yaml ["), None);
+    }
 
     #[test]
     fn reads_tool_responses_and_whether_they_ran() {
@@ -873,13 +911,13 @@ mod tests {
         let r = failure_reason(&said_of(fixture!("no-provider.stdout")), &[]);
         assert_eq!(
             r.as_deref(),
-            Some("error: No provider configured. Run 'goose configure' first.")
+            Some("error: No provider configured. Run 'goose configure' first")
         );
         // Without --quiet goose first prints the recipe's parameters, the event's values.
         let r = failure_reason(&said_of(fixture!("no-provider-without-quiet.stdout")), &[]);
         assert_eq!(
             r.as_deref(),
-            Some("error: No provider configured. Run 'goose configure' first.")
+            Some("error: No provider configured. Run 'goose configure' first")
         );
         // An error explained on the lines after it keeps its first line.
         let r = failure_reason(&said_of(fixture!("unknown-provider.stdout")), &[]).unwrap();
@@ -888,6 +926,18 @@ mod tests {
             "{r}"
         );
         assert!(r.chars().count() <= REASON_MAX, "{r}");
+    }
+
+    #[test]
+    fn reasons_are_one_line_without_a_closing_full_stop() {
+        assert_eq!(
+            reason_text("Request failed (provider request id: r1).\\n\\nPlease retry.\n"),
+            "Request failed (provider request id: r1). Please retry"
+        );
+        assert_eq!(
+            reason_text("Headless run interrupted"),
+            "Headless run interrupted"
+        );
     }
 
     #[test]

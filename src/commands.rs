@@ -286,8 +286,8 @@ pub fn approve(cfg: &Config, run: i64, yes: bool) -> Result<()> {
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         if !matches!(answer.trim(), "y" | "Y" | "yes") {
-            say!("not approved; the run stays held");
-            return Ok(());
+            // A distinct outcome from approving: exit status 1, as for every refusal.
+            bail!("not approved; run {run} stays held");
         }
     }
     store.approve_call(run, shown.id)?;

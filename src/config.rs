@@ -85,9 +85,11 @@ pub struct Rule {
 impl Config {
     /// Loads and checks the config file (`path`, else the default one): `run` needs it.
     pub fn load(path: Option<&Path>) -> Result<Config> {
-        let path = path
-            .map(Path::to_path_buf)
-            .unwrap_or_else(crate::default_config_path);
+        let named = std::env::var_os(crate::CONFIG_ENV);
+        let path = match path {
+            Some(p) => p.to_path_buf(),
+            None => named_config(named)?.unwrap_or_else(crate::default_config_path),
+        };
         let text = std::fs::read_to_string(&path).with_context(|| {
             format!(
                 "reading the config file {} (see the README for an example)",
@@ -98,15 +100,12 @@ impl Config {
     }
 
     /// The config as far as `status`, `log`, `approve` and `reject` need it (where state
-    /// lives): the defaults when no config file exists.
+    /// lives). A file named by `-c` or `GOOSE_TRIGGERS_CONFIG` must exist, as for `run`, so a
+    /// mistyped name never makes these commands act on another state folder; with neither, the
+    /// defaults serve when the default file does not exist.
     pub fn load_for_state(path: Option<&Path>) -> Result<Config> {
-        let default = crate::default_config_path();
-        let path = match path {
-            Some(p) => Some(p.to_path_buf()),
-            None if default.exists() => Some(default),
-            None => None,
-        };
-        match path {
+        let named = std::env::var_os(crate::CONFIG_ENV);
+        match state_config_path(path, named, crate::default_config_path())? {
             Some(p) => {
                 let text = std::fs::read_to_string(&p)
                     .with_context(|| format!("reading the config file {}", p.display()))?;
@@ -130,7 +129,15 @@ impl Config {
     /// `strict` checks what running the rules needs: their folders and recipes exist and the
     /// webhook secret is set. The other commands only need to know where state lives.
     pub fn parse_with(text: &str, path: &Path, strict: bool) -> Result<Config> {
-        let raw: RawConfig = serde_yaml_ng::from_str(text)
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(text)
+            .with_context(|| format!("reading the config file {}", path.display()))?;
+        if doc.is_null() {
+            bail!(
+                "the config file {} is empty (see the README for an example)",
+                path.display()
+            );
+        }
+        let raw: RawConfig = serde_yaml_ng::from_value(doc)
             .with_context(|| format!("reading the config file {}", path.display()))?;
         let base = path
             .parent()
@@ -216,6 +223,42 @@ impl Config {
 
     pub fn runs_dir(&self) -> PathBuf {
         self.state_dir.join("runs")
+    }
+}
+
+/// The config file `GOOSE_TRIGGERS_CONFIG` names (its value, `named`): set but empty is an
+/// error, as a name that is not a file is wherever it is read.
+fn named_config(named: Option<std::ffi::OsString>) -> Result<Option<PathBuf>> {
+    match named {
+        Some(v) if v.is_empty() => bail!(
+            "{} is set but empty: unset it, or set it to the config file",
+            crate::CONFIG_ENV
+        ),
+        Some(v) => Ok(Some(PathBuf::from(v))),
+        None => Ok(None),
+    }
+}
+
+/// The config file the state commands read: the one `-c` gives, else the one
+/// `GOOSE_TRIGGERS_CONFIG` names (`named`), which must exist; else the default file
+/// (`default`) if it exists; else none, and the defaults serve.
+fn state_config_path(
+    given: Option<&Path>,
+    named: Option<std::ffi::OsString>,
+    default: PathBuf,
+) -> Result<Option<PathBuf>> {
+    if let Some(p) = given {
+        return Ok(Some(p.to_path_buf()));
+    }
+    match named_config(named)? {
+        Some(p) if !p.is_file() => bail!(
+            "{} names {}, which is not a file",
+            crate::CONFIG_ENV,
+            p.display()
+        ),
+        Some(p) => Ok(Some(p)),
+        None if default.exists() => Ok(Some(default)),
+        None => Ok(None),
     }
 }
 
@@ -328,6 +371,48 @@ rules:
         assert_eq!(c.rules[0].working_dir, dir.join("state/work/invoices"));
         assert!(matches!(c.rules[1].source, Source::Webhook));
         assert_eq!(c.webhook.unwrap().listen, "127.0.0.1:8787");
+    }
+
+    #[test]
+    fn state_commands_refuse_a_named_config_that_is_missing_or_empty() {
+        let dir = setup();
+        let missing = dir.join("config.yml");
+        let default = dir.join("default.yaml");
+        // GOOSE_TRIGGERS_CONFIG naming a missing file: an error, not the default state folder.
+        let err = state_config_path(None, Some(missing.clone().into()), default.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a file"), "{err}");
+        let err = state_config_path(None, Some("".into()), default.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("set but empty"), "{err}");
+        // -c wins; with neither, the default file only when it exists.
+        assert_eq!(
+            state_config_path(Some(&missing), Some("x".into()), default.clone()).unwrap(),
+            Some(missing.clone())
+        );
+        assert_eq!(
+            state_config_path(None, None, default.clone()).unwrap(),
+            None
+        );
+        std::fs::write(&default, "state_dir: s\n").unwrap();
+        assert_eq!(
+            state_config_path(None, None, default.clone()).unwrap(),
+            Some(default.clone())
+        );
+        assert_eq!(
+            state_config_path(None, Some(default.clone().into()), dir.join("other")).unwrap(),
+            Some(default)
+        );
+        // An empty file, or one of comments only, is refused by every command.
+        for text in ["", "\n", "# nothing yet\n"] {
+            let err = format!(
+                "{:#}",
+                Config::parse_with(text, &missing, false).unwrap_err()
+            );
+            assert!(err.contains("is empty"), "{text:?}: {err}");
+        }
     }
 
     #[test]

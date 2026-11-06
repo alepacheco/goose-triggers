@@ -74,7 +74,7 @@ enum Cmd {
         #[arg(long)]
         keep: bool,
     },
-    /// Run hostile events (injected instructions in webhook fields and files) against the example rules' recipes, with no holds and with their holds; a scripted model makes every call the injections name; no API key needed
+    /// Run hostile events (injected instructions in webhook fields and files) against the example rules' recipes, with no holds and with their holds; by default a scripted model makes every call the injections name (no API key needed), or a real model through goose's own provider
     HostileSuite {
         /// The goose binary to test with [default: goose on PATH]
         #[arg(long, value_name = "PATH")]
@@ -85,6 +85,18 @@ enum Cmd {
         /// Keep the suite's temporary folder even when every result is as expected
         #[arg(long)]
         keep: bool,
+        /// Send the events to a real model through this goose provider (ollama, openai, anthropic, ...), set up through the environment as goose reads it (OLLAMA_HOST, OPENAI_API_KEY, ...); needs --model
+        #[arg(long, value_name = "NAME", requires = "model")]
+        provider: Option<String>,
+        /// The real model, as the provider names it (qwen3:8b, ...); needs --provider
+        #[arg(long, value_name = "NAME", requires = "provider")]
+        model: Option<String>,
+        /// With a real model: also send this many plain entries (at most 10) and approve every call they are held at, to see what the model does after an approval
+        #[arg(long, value_name = "N", default_value_t = 0, requires = "provider")]
+        approvals: usize,
+        /// With a real model: how long one run may take, in minutes
+        #[arg(long, value_name = "MINUTES", default_value_t = 20)]
+        run_minutes: u64,
     },
     /// Called by goose through goose-triggers' plugin hooks; not for direct use
     #[command(hide = true)]
@@ -116,7 +128,25 @@ fn main() -> ExitCode {
         Cmd::Reject { run } => config::Config::load_for_state(cli.config.as_deref())
             .and_then(|c| commands::reject(&c, run)),
         Cmd::Selftest { goose, keep } => selftest::run(goose, keep),
-        Cmd::HostileSuite { goose, holds, keep } => hostile::run(goose, holds, keep),
+        Cmd::HostileSuite {
+            goose,
+            holds,
+            keep,
+            provider,
+            model,
+            approvals,
+            run_minutes,
+        } => hostile::run(hostile::Options {
+            goose,
+            holds,
+            keep,
+            model: match (provider, model) {
+                (Some(provider), Some(model)) => hostile::Model::Real { provider, model },
+                _ => hostile::Model::Scripted,
+            },
+            approvals,
+            run_minutes,
+        }),
         Cmd::Hook => unreachable!(),
     };
     match result {
@@ -128,11 +158,12 @@ fn main() -> ExitCode {
     }
 }
 
-/// The default config file: `$GOOSE_TRIGGERS_CONFIG`, else `~/.config/goose-triggers/config.yaml`.
+/// The environment variable naming the config file.
+pub const CONFIG_ENV: &str = "GOOSE_TRIGGERS_CONFIG";
+
+/// The default config file, `~/.config/goose-triggers/config.yaml`, used when neither `-c`
+/// nor `GOOSE_TRIGGERS_CONFIG` names one.
 pub fn default_config_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("GOOSE_TRIGGERS_CONFIG") {
-        return PathBuf::from(p);
-    }
     util::config_home()
         .join("goose-triggers")
         .join("config.yaml")

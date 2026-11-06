@@ -174,13 +174,22 @@ pub fn output_within(
     cmd: &mut std::process::Command,
     limit: std::time::Duration,
 ) -> std::io::Result<Option<std::process::Output>> {
-    use std::io::Read;
     use std::process::Stdio;
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    wait_output(&mut child, limit)
+}
+
+/// Reads a started command's piped output whole and waits for it to end, killing it if it
+/// takes over `limit`: its output, or None when it took too long.
+pub fn wait_output(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read;
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     // Read on threads of their own, so a full pipe never stops the command.

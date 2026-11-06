@@ -14,6 +14,7 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -189,6 +190,7 @@ impl Harness {
             .stderr(Stdio::from(log))
             .spawn()
             .context("starting goose-triggers run")?;
+        DAEMON_PID.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
         self.daemon = Some(child);
         let listen = self.listen.clone();
         wait_for("the webhook listener", Duration::from_secs(20), || {
@@ -211,6 +213,7 @@ impl Harness {
         let Some(mut d) = self.daemon.take() else {
             return Ok(());
         };
+        DAEMON_PID.store(0, std::sync::atomic::Ordering::SeqCst);
         // SAFETY: SIGTERM to the daemon this selftest started.
         unsafe {
             libc::kill(d.id() as libc::pid_t, libc::SIGTERM);
@@ -225,6 +228,64 @@ impl Harness {
         let _ = d.kill();
         let _ = d.wait();
         bail!("goose-triggers run did not stop within 30 s of SIGTERM")
+    }
+
+    /// Runs `approve <run>` with a pseudo-terminal as its input, answering `answer`; returns
+    /// its exit status and what it printed.
+    fn approve_on_terminal(
+        &self,
+        run: i64,
+        answer: &str,
+    ) -> Result<(std::process::ExitStatus, String)> {
+        use std::io::Write;
+        use std::os::fd::{FromRawFd, OwnedFd};
+        // SAFETY: posix_openpt returns a descriptor this process then owns; grantpt, unlockpt
+        // and ptsname_r only act on it and fill the buffer given.
+        let (master, slave) = unsafe {
+            let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+            if fd < 0 {
+                bail!("posix_openpt: {}", std::io::Error::last_os_error());
+            }
+            let master = OwnedFd::from_raw_fd(fd);
+            let mut name = [0 as libc::c_char; 128];
+            if libc::grantpt(fd) != 0
+                || libc::unlockpt(fd) != 0
+                || libc::ptsname_r(fd, name.as_mut_ptr(), name.len()) != 0
+            {
+                bail!(
+                    "opening a pseudo-terminal: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let path = std::ffi::CStr::from_ptr(name.as_ptr())
+                .to_string_lossy()
+                .into_owned();
+            let slave = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open(&path)
+                .with_context(|| format!("opening {path}"))?;
+            (std::fs::File::from(master), slave)
+        };
+        let mut child = self
+            .command(&["approve", &run.to_string()])
+            .stdin(Stdio::from(slave))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        (&master).write_all(answer.as_bytes())?;
+        let out = crate::util::wait_output(&mut child, Duration::from_secs(20))?
+            .context("approve on a terminal did not end within 20 s")?;
+        drop(master);
+        Ok((
+            out.status,
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        ))
     }
 
     fn run_of(&self, rule: &str) -> Result<Option<Run>> {
@@ -373,6 +434,17 @@ impl Harness {
         self.check(
             refused.as_ref().is_err_and(|e| e.to_string().contains("--yes")) && still_held,
             &format!("goose-triggers approve {folder_run} with no terminal to ask on and no --yes: refused, the run still held"),
+        )?;
+
+        // On a terminal, approve asks; any answer but yes leaves the run held, exit status 1.
+        let (declined, said) = self.approve_on_terminal(folder_run, "n\n")?;
+        let still_held = self
+            .store()?
+            .run(folder_run)?
+            .is_some_and(|r| r.state == state::HELD);
+        self.check(
+            !declined.success() && said.contains("Approve this call?") && said.contains("not approved") && still_held,
+            &format!("goose-triggers approve {folder_run} on a terminal, answered n: not approved, exit status {}, the run still held", declined.code().unwrap_or(-1)),
         )?;
 
         // Approve: the same session resumes, the approved call runs once, the run finishes.
@@ -685,6 +757,62 @@ impl Harness {
     }
 }
 
+/// Set by SIGINT or SIGTERM during a selftest or hostile suite.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The `goose-triggers run` the selftest or suite has started, if any (0: none).
+static DAEMON_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn on_interrupt(_: libc::c_int) {
+    INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// On SIGINT or SIGTERM (Ctrl-C), stops the `goose-triggers run` started for the test, removes
+/// its temporary folder `dir` (unless `keep`) and exits with status 130.
+pub(crate) fn clean_up_on_interrupt(dir: &Path, keep: bool) {
+    use std::sync::atomic::Ordering;
+    // SAFETY: the handler only stores to an atomic.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            on_interrupt as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            on_interrupt as *const () as libc::sighandler_t,
+        );
+    }
+    let dir = dir.to_path_buf();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(100));
+        if !INTERRUPTED.load(Ordering::SeqCst) {
+            continue;
+        }
+        let pid = DAEMON_PID.swap(0, Ordering::SeqCst);
+        if pid > 0 {
+            // SAFETY: SIGTERM to the daemon this test started, then reaping it if it is still
+            // this process's child (waitpid fails once the main thread has reaped it).
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(30) {
+                let mut status = 0;
+                if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } != 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        if keep {
+            println!("interrupted; its files: {}", dir.display());
+        } else {
+            let _ = std::fs::remove_dir_all(&dir);
+            println!("interrupted; its temporary folder is removed");
+        }
+        std::process::exit(130);
+    });
+}
+
 /// The writing end of a pipe whose reading end is closed already: every write to it fails.
 pub(crate) fn closed_pipe() -> Result<Stdio> {
     use std::os::fd::{FromRawFd, OwnedFd};
@@ -724,6 +852,7 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
         crate::util::now()
     ));
     crate::util::create_private_dir(&dir)?;
+    clean_up_on_interrupt(&dir, keep);
     for d in ["inbox", "recipes", "work", "goose-root", "state"] {
         std::fs::create_dir_all(dir.join(d))?;
     }

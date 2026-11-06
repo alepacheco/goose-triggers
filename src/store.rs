@@ -490,6 +490,17 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// What became of each approval a run was given, in order: `open` (not used yet), `used`
+    /// (the run made that exact call), `lapsed` (it stopped at another held call first) or
+    /// `withdrawn`.
+    pub fn permission_states(&self, run_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT state FROM permissions WHERE run_id = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([run_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Whether a run holds an approval not yet used.
     pub fn has_open_permission(&self, run_id: i64) -> Result<bool> {
         let n: i64 = self.conn.query_row(

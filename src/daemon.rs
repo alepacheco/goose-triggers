@@ -184,11 +184,13 @@ fn check_rule(rule: &Rule, exe: &Path) -> Result<()> {
     crate::plugin::preflight(&rule.working_dir).with_context(|| format!("rule {}", rule.name))?;
     let info = crate::recipe::read(&rule.recipe).with_context(|| format!("rule {}", rule.name))?;
     if !rule.hold.is_empty() {
-        let provider = rule.provider.clone().or(info.provider).or_else(|| {
-            std::env::var("GOOSE_PROVIDER")
-                .ok()
-                .filter(|p| !p.is_empty())
-        });
+        // The same order goose follows: the rule's, the recipe's, GOOSE_PROVIDER, goose's own
+        // config. Each run checks again as it starts, in case goose's config has changed.
+        let provider = rule
+            .provider
+            .clone()
+            .or(info.provider)
+            .or_else(runner::goose_default_provider);
         if let Some(p) = provider.filter(|p| crate::util::is_cli_agent_provider(p)) {
             bail!(
                 "rule {}: provider {p} runs its own tools, so goose's hooks never see them and the rule's holds could not be enforced",
@@ -345,7 +347,7 @@ pub fn run(cfg: Config) -> Result<()> {
         }
     }
     say(&format!(
-        "goose {} ({goose}); state in {}",
+        "goose {goose} ({}); state in {}",
         cfg.goose,
         cfg.state_dir.display()
     ));
