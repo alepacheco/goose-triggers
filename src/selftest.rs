@@ -3,7 +3,8 @@
 //! folder event -> run -> hold -> webhook event -> run -> hold -> restart -> holds still
 //! there -> approve -> the same goose session resumes -> the approved call runs -> done;
 //! approve -> a differing call is held again -> reject -> the run ends, nothing ran;
-//! an event whose value would add a command to the recipe -> refused before goose runs.
+//! an event whose value would add a command to the recipe -> refused before goose runs;
+//! a run goose fails -> failed with goose's own reason, none of the event's values in it.
 //! Everything happens in a temporary folder, with goose's own folders there too
 //! (`GOOSE_PATH_ROOT`), so the user's goose settings and sessions are not touched.
 
@@ -57,6 +58,9 @@ extensions:
 
 const FOLDER_RULE: &str = "selftest-folder";
 const WEBHOOK_RULE: &str = "selftest-webhook";
+/// A rule whose runs goose fails: it names a provider goose does not have.
+const FAIL_RULE: &str = "selftest-fail";
+const MISSING_PROVIDER: &str = "goose-triggers-selftest-missing";
 const SECRET_ENV: &str = "GOOSE_TRIGGERS_SELFTEST_SECRET";
 const WAIT: Duration = Duration::from_secs(90);
 
@@ -438,6 +442,40 @@ impl Selftest {
             ),
         )?;
 
+        // A run goose fails says why in goose's words; the event's values are not its reason.
+        let value = "B-77-error-in-the-value";
+        let (st, reply) = http(
+            &self.listen,
+            "POST",
+            &format!("/hooks/{FAIL_RULE}"),
+            Some(&secret),
+            &json!({ "order": value }).to_string(),
+        )?;
+        let fail_run = serde_json::from_str::<serde_json::Value>(&reply)
+            .ok()
+            .and_then(|v| v["run"].as_i64())
+            .filter(|_| st == 202)
+            .with_context(|| format!("webhook answered {st} {reply}"))?;
+        let r = wait_for("the failing run to end", WAIT, || {
+            let r = self.store()?.run(fail_run)?.context("run gone")?;
+            Ok(
+                ([state::FAILED, state::DONE, state::HELD].contains(&r.state.as_str())
+                    && r.pid.is_none())
+                .then_some(r),
+            )
+        })?;
+        let error = r.error.unwrap_or_default();
+        self.check(
+            r.state == state::FAILED
+                && error.starts_with("goose exited with")
+                && error.contains(MISSING_PROVIDER)
+                && !error.contains(value),
+            &format!(
+                "run {fail_run}: goose failed (provider {MISSING_PROVIDER}); the run says why in goose's words, without the event's values: {}",
+                crate::util::short(&error, 160)
+            ),
+        )?;
+
         let log = self.cli(&["log", &folder_run.to_string()])?;
         self.check(
             log.contains("approved call made") && log.contains(DONE_TEXT),
@@ -506,7 +544,7 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
     let secret = format!("selftest-{}-{:x}", std::process::id(), crate::util::now());
     let config = dir.join("config.yaml");
     let cfg = format!(
-        "state_dir: {state}\ngoose: {goose}\nwebhook:\n  listen: {listen}\n  secret_env: {SECRET_ENV}\nrules:\n  - name: {FOLDER_RULE}\n    folder: {inbox}\n    pattern: \"*.txt\"\n    recipe: {folder}\n    hold: [shell]\n    working_dir: {wf}\n  - name: {WEBHOOK_RULE}\n    webhook: true\n    recipe: {webhook}\n    hold: [shell]\n    working_dir: {ww}\n",
+        "state_dir: {state}\ngoose: {goose}\nwebhook:\n  listen: {listen}\n  secret_env: {SECRET_ENV}\nrules:\n  - name: {FOLDER_RULE}\n    folder: {inbox}\n    pattern: \"*.txt\"\n    recipe: {folder}\n    hold: [shell]\n    working_dir: {wf}\n  - name: {WEBHOOK_RULE}\n    webhook: true\n    recipe: {webhook}\n    hold: [shell]\n    working_dir: {ww}\n  - name: {FAIL_RULE}\n    webhook: true\n    recipe: {webhook}\n    hold: [shell]\n    provider: {MISSING_PROVIDER}\n    working_dir: {wx}\n",
         state = yaml_str(&dir.join("state")),
         goose = serde_json::to_string(&goose)?,
         inbox = yaml_str(&dir.join("inbox")),
@@ -514,6 +552,7 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
         webhook = yaml_str(&dir.join("recipes/webhook.yaml")),
         wf = yaml_str(&dir.join("work/folder")),
         ww = yaml_str(&dir.join("work/webhook")),
+        wx = yaml_str(&dir.join("work/fail")),
     );
     std::fs::write(&config, cfg)?;
     let env: Vec<(String, String)> = [

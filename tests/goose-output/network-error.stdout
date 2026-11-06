@@ -1,0 +1,2 @@
+{"type":"message","message":{"id":"msg_de430b54-6f25-480c-96a7-9b0dbbccda65","role":"assistant","created":1793934419,"content":[{"type":"error","kind":"other","message":"Network error: Could not connect to 127.0.0.1:9 — check your network connection and try again.\n\nPlease resend your message to try again."}],"metadata":{"userVisible":true,"agentVisible":false}}}
+{"type":"error","error":"Network error: Could not connect to 127.0.0.1:9 — check your network connection and try again.\n\nPlease resend your message to try again."}

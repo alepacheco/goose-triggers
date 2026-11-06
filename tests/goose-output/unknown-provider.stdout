@@ -1,0 +1,6 @@
+
+  error: Error Unknown provider: nosuch.
+Please check your system keychain and run 'goose configure' again.
+If your system is unable to use the keyring, please try setting secret key(s) via environment variables.
+For more info, see: https://goose-docs.ai/docs/troubleshooting/#keychainkeyring-errors
+

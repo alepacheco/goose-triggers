@@ -31,6 +31,11 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// a longer one is referred to (goose's session holds it), which keeps the message within
 /// what one command-line argument may carry.
 const RESUME_INPUT_MAX: usize = 4000;
+/// A failure reason quoted from goose is cut to this many characters.
+const REASON_MAX: usize = 300;
+/// The lines of goose's stderr a failure reason may come from, and the bytes read for them.
+const STDERR_LINES: usize = 20;
+const TAIL_BYTES: u64 = 16 * 1024;
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -193,7 +198,9 @@ fn goose_command(ctx: &Ctx, run: &Run, mode: &Mode, wd: &Path, stderr: File) -> 
     if let Some(t) = run.max_turns {
         cmd.arg("--max-turns").arg(t.to_string());
     }
-    cmd.args(["--output-format", "stream-json"]);
+    // Quiet: goose prints neither the recipe's parameters (the event's values) nor its banner,
+    // so what it prints besides its stream-json events is its own messages.
+    cmd.args(["--quiet", "--output-format", "stream-json"]);
     cmd.current_dir(wd)
         .env("GOOSE_MODE", "auto")
         // A message starting with `/` would otherwise run one of the user's slash-command
@@ -327,10 +334,8 @@ struct Watched {
     status: ExitStatus,
     kill: Option<Kill>,
     saw_complete: bool,
-    last_error: Option<String>,
     unseen_call: Option<String>,
-    /// goose's last lines of plain text.
-    said: Vec<String>,
+    said: Said,
 }
 
 fn run_goose(ctx: &Ctx, run: &Run, mode: &Mode) -> Result<()> {
@@ -366,6 +371,8 @@ fn run_goose(ctx: &Ctx, run: &Run, mode: &Mode) -> Result<()> {
             .open(runs_dir.join(name))
     };
     let stderr = private(format!("{}.stderr", run.id))?;
+    // The file keeps every goose process of the run (start and resumes): this one writes from here.
+    let stderr_from = stderr.metadata()?.len();
     let out_log = private(format!("{}.jsonl", run.id))?;
     let mut cmd = goose_command(ctx, run, mode, &wd, stderr)?;
 
@@ -392,8 +399,12 @@ fn run_goose(ctx: &Ctx, run: &Run, mode: &Mode) -> Result<()> {
         }
     };
     store.set_pid(run.id, None)?;
-    let stderr_path = runs_dir.join(format!("{}.stderr", run.id));
-    finish(&store, run, mode, &wd, &stderr_path, watched)
+    let stderr = tail(
+        &runs_dir.join(format!("{}.stderr", run.id)),
+        stderr_from,
+        STDERR_LINES,
+    );
+    finish(&store, run, mode, &wd, &stderr, watched)
 }
 
 fn watch(
@@ -431,9 +442,7 @@ fn watch(
     let mut stopper = Stopper::new(pid);
     let mut hold: Option<(Instant, Option<String>)> = None;
     let mut saw_complete = false;
-    let mut last_error: Option<String> = None;
-    // goose's last lines that are not JSON (its own error messages, say).
-    let mut said: Vec<String> = Vec::new();
+    let mut said = Said::default();
     let mut unseen_call: Option<String> = None;
     let mut checked = Instant::now() - Duration::from_secs(1);
 
@@ -448,26 +457,13 @@ fn watch(
                        stopper: &mut Stopper,
                        exited: bool|
      -> Result<()> {
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            let text = line.trim();
-            if !text.is_empty() {
-                said.push(text.to_string());
-                if said.len() > 3 {
-                    said.remove(0);
-                }
-            }
+        let (text, event) = split_line(line);
+        said.take(text, event.as_ref());
+        let Some(v) = event else {
             return Ok(());
         };
-        match v.get("type").and_then(Value::as_str) {
-            Some("complete") => saw_complete = true,
-            Some("error") => {
-                last_error = v.get("error").or_else(|| v.get("message")).map(|e| {
-                    e.as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| e.to_string())
-                })
-            }
-            _ => {}
+        if v.get("type").and_then(Value::as_str) == Some("complete") {
+            saw_complete = true;
         }
         for r in tool_responses(&v) {
             if r.success && !store.hook_saw(run.id, &r.id)? {
@@ -496,7 +492,7 @@ fn watch(
     let status = loop {
         if let Ok(line) = rx.recv_timeout(Duration::from_millis(100)) {
             if hold.is_none() {
-                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                if let (_, Some(v)) = split_line(&line) {
                     answered.extend(tool_responses(&v).into_iter().map(|r| r.id));
                 }
             }
@@ -546,17 +542,104 @@ fn watch(
         status,
         kill: stopper.reason(),
         saw_complete,
-        last_error,
         unseen_call,
         said,
     })
 }
 
-/// The last `n` lines of a file that are not empty.
-pub fn tail(path: &Path, n: usize) -> Vec<String> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let lines: Vec<String> = text
-        .lines()
+/// One line of goose's output: the text goose printed itself, and the stream-json event on
+/// it. goose prints its interrupt prompt without a line end, so an event can follow text on
+/// the same line.
+pub fn split_line(line: &str) -> (&str, Option<Value>) {
+    let event = |s: &str| {
+        serde_json::from_str::<Value>(s)
+            .ok()
+            .filter(Value::is_object)
+    };
+    if let Some(v) = event(line) {
+        return ("", Some(v));
+    }
+    if let Some(at) = line.find("{\"type\":") {
+        if let Some(v) = event(&line[at..]) {
+            return (line[..at].trim(), Some(v));
+        }
+    }
+    (line.trim(), None)
+}
+
+/// What goose said while it ran: its last error event, and its last lines of plain text
+/// (with `--quiet`, its own messages, such as an error before the run starts).
+#[derive(Default, Debug)]
+struct Said {
+    error: Option<String>,
+    lines: Vec<String>,
+}
+
+impl Said {
+    const KEEP: usize = 20;
+
+    fn take(&mut self, text: &str, event: Option<&Value>) {
+        if !text.is_empty() {
+            self.lines.push(text.to_string());
+            if self.lines.len() > Self::KEEP {
+                self.lines.remove(0);
+            }
+        }
+        if let Some(v) = event.filter(|v| v.get("type").and_then(Value::as_str) == Some("error")) {
+            self.error = v.get("error").or_else(|| v.get("message")).map(|e| {
+                e.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| e.to_string())
+            });
+        }
+    }
+}
+
+/// goose's words in plain lines: from its last line that starts with "error" on (goose
+/// starts its errors so, and may explain them on the lines after), else its last three lines.
+fn error_lines(lines: &[String]) -> Option<String> {
+    let from = lines
+        .iter()
+        .rposition(|l| l.to_ascii_lowercase().starts_with("error"))
+        .unwrap_or(lines.len().saturating_sub(3));
+    let text = lines[from..].join(" / ");
+    (!text.is_empty()).then_some(text)
+}
+
+/// Why goose failed, in goose's own words: its error event, else the error it printed, else
+/// the end of what this goose process wrote on stderr. Shortened to `REASON_MAX` characters,
+/// keeping its start, where goose names the error.
+fn failure_reason(said: &Said, stderr: &[String]) -> Option<String> {
+    said.error
+        .clone()
+        .or_else(|| error_lines(&said.lines))
+        .or_else(|| error_lines(stderr))
+        .map(|r| short(&r, REASON_MAX))
+}
+
+/// The last `n` lines that are not empty of what a file holds from byte `from` on, read from
+/// at most its last `TAIL_BYTES`; bytes that are not UTF-8 show as U+FFFD.
+pub fn tail(path: &Path, from: u64, n: usize) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = File::open(path) else {
+        return Vec::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = from.max(len.saturating_sub(TAIL_BYTES));
+    let mut buf = Vec::new();
+    if start >= len
+        || f.seek(SeekFrom::Start(start)).is_err()
+        || f.take(len - start).read_to_end(&mut buf).is_err()
+    {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines = text.lines();
+    if start > from {
+        // Cut in the middle of the file: its first line may be the end of a longer one.
+        lines.next();
+    }
+    let lines: Vec<String> = lines
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(str::to_string)
@@ -569,7 +652,7 @@ fn finish(
     run: &Run,
     mode: &Mode,
     wd: &Path,
-    stderr_path: &Path,
+    stderr: &[String],
     w: Watched,
 ) -> Result<()> {
     let cur = store.run(run.id)?.context("the run left the store")?;
@@ -616,19 +699,11 @@ fn finish(
         return fail("goose-triggers was stopped while the run was going");
     }
     if !w.status.success() {
-        // goose's own reason first: its error event, else what it printed last.
-        let why = w
-            .last_error
-            .clone()
-            .or_else(|| (!w.said.is_empty()).then(|| w.said.join(" / ")))
-            .or_else(|| {
-                let t = tail(stderr_path, 3);
-                (!t.is_empty()).then(|| t.join(" / "))
-            });
         return fail(&format!(
             "goose exited with {}{}; see goose-triggers log {id}",
             w.status,
-            why.map(|e| format!(": {}", short(&e, 300)))
+            failure_reason(&w.said, stderr)
+                .map(|e| format!(": {e}"))
                 .unwrap_or_default()
         ));
     }
@@ -647,8 +722,9 @@ fn finish(
     fail(&format!(
         "goose exited ({}) without finishing its turn{}; see goose-triggers log {id}",
         w.status,
-        w.last_error
-            .map(|e| format!(": {}", short(&e, 300)))
+        w.said
+            .error
+            .map(|e| format!(": {}", short(&e, REASON_MAX)))
             .unwrap_or_default()
     ))
 }
@@ -683,6 +759,203 @@ mod tests {
         ]}});
         assert!(tool_responses(&v).is_empty());
         assert!(tool_responses(&json!({"type": "complete"})).is_empty());
+    }
+
+    /// Feeds goose's output, line by line, to what `watch` keeps of it.
+    fn said_of(stdout: &str) -> Said {
+        let mut said = Said::default();
+        for line in stdout.lines() {
+            let (text, event) = split_line(line);
+            said.take(text, event.as_ref());
+        }
+        said
+    }
+
+    fn lines(text: &str) -> Vec<String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    // The fixtures are goose 1.57.0's own stdout and stderr in `goose run --quiet
+    // --output-format stream-json`, as goose-triggers runs it, and one without `--quiet`.
+    macro_rules! fixture {
+        ($name:literal) => {
+            include_str!(concat!("../tests/goose-output/", $name))
+        };
+    }
+
+    #[test]
+    fn failure_reason_is_the_error_goose_printed_not_the_event_values() {
+        // No provider configured: goose prints its error on stdout and nothing on stderr.
+        let r = failure_reason(&said_of(fixture!("no-provider.stdout")), &[]);
+        assert_eq!(
+            r.as_deref(),
+            Some("error: No provider configured. Run 'goose configure' first.")
+        );
+        // Without --quiet goose first prints the recipe's parameters, the event's values.
+        let r = failure_reason(&said_of(fixture!("no-provider-without-quiet.stdout")), &[]);
+        assert_eq!(
+            r.as_deref(),
+            Some("error: No provider configured. Run 'goose configure' first.")
+        );
+        // An error explained on the lines after it keeps its first line.
+        let r = failure_reason(&said_of(fixture!("unknown-provider.stdout")), &[]).unwrap();
+        assert!(
+            r.starts_with("error: Error Unknown provider: nosuch. / Please check"),
+            "{r}"
+        );
+        assert!(r.chars().count() <= REASON_MAX, "{r}");
+    }
+
+    #[test]
+    fn failure_reason_prefers_goose_s_error_event() {
+        let r = failure_reason(
+            &said_of(fixture!("network-error.stdout")),
+            &lines(fixture!("network-error.stderr")),
+        )
+        .unwrap();
+        assert!(
+            r.starts_with("Network error: Could not connect to 127.0.0.1:9"),
+            "{r}"
+        );
+        // goose's interrupt prompt has no line end: its error event follows on the same line.
+        let said = said_of(fixture!("interrupted.stdout"));
+        assert_eq!(said.error.as_deref(), Some("Headless run interrupted"));
+        assert_eq!(said.lines, ["Yes — what would you like me to do?"]);
+    }
+
+    #[test]
+    fn a_kept_0_0_1_run_log_gives_goose_s_error_not_its_banner() {
+        // goose 1.57.0's first process of a selftest run under goose-triggers 0.0.1 (no
+        // --quiet), stopped at the hold: parameters, banner, two events, then the interrupt
+        // prompt with the error event after it.
+        let said = said_of(fixture!("held-0.0.1.stdout"));
+        assert_eq!(said.error.as_deref(), Some("Headless run interrupted"));
+        assert_eq!(
+            failure_reason(&said, &[]).as_deref(),
+            Some("Headless run interrupted")
+        );
+        assert!(said.lines.iter().any(|l| l.contains("order: A-1001")));
+    }
+
+    #[test]
+    fn failure_reason_falls_back_to_stderr_and_the_last_lines() {
+        let said = Said::default();
+        assert_eq!(failure_reason(&said, &[]), None);
+        let r = failure_reason(&said, &lines(fixture!("interrupted.stderr")));
+        assert_eq!(r.as_deref(), Some("Error: Headless run interrupted"));
+        let panic = lines("thread 'main' panicked at src/main.rs:3:5:\nsomething broke\nnote: run with `RUST_BACKTRACE=1`\n");
+        let r = failure_reason(&said, &panic).unwrap();
+        assert!(r.starts_with("thread 'main' panicked"), "{r}");
+        let long = vec![format!("error: {}", "x".repeat(1000))];
+        let r = failure_reason(&said, &long).unwrap();
+        assert!(r.starts_with("error: xxx") && r.chars().count() == REASON_MAX);
+    }
+
+    #[test]
+    fn split_line_reads_plain_text_and_events() {
+        assert_eq!(split_line("  error: boom  "), ("error: boom", None));
+        let (t, v) = split_line(r#"{"type":"complete"}"#);
+        assert_eq!((t, v.unwrap()["type"].as_str()), ("", Some("complete")));
+        // Text that is JSON but no event stays text.
+        assert_eq!(split_line("42"), ("42", None));
+        assert_eq!(
+            split_line(r#"a {"type": broken"#),
+            (r#"a {"type": broken"#, None)
+        );
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "gt-runner-{}-{}-{name}",
+            std::process::id(),
+            crate::util::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    #[test]
+    fn tail_reads_only_this_process_s_stderr() {
+        let p = temp("1.stderr");
+        std::fs::write(&p, "Error: Headless run interrupted\n").unwrap();
+        let from = std::fs::metadata(&p).unwrap().len();
+        let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"Error: provider down\n\n").unwrap();
+        assert_eq!(tail(&p, from, 20), ["Error: provider down"]);
+        assert_eq!(
+            tail(&p, 0, 20),
+            ["Error: Headless run interrupted", "Error: provider down"]
+        );
+        assert_eq!(tail(&p, 0, 1), ["Error: provider down"]);
+        let len = std::fs::metadata(&p).unwrap().len();
+        assert!(tail(&p, len, 20).is_empty());
+        assert!(tail(&p.with_extension("none"), 0, 20).is_empty());
+    }
+
+    #[test]
+    fn tail_survives_bytes_that_are_not_utf8_and_big_files() {
+        let p = temp("2.stderr");
+        std::fs::write(&p, b"Error: bad \xff\xfe bytes\n").unwrap();
+        let t = tail(&p, 0, 20);
+        assert_eq!(t.len(), 1);
+        assert!(t[0].starts_with("Error: bad ") && t[0].contains('\u{fffd}'));
+        // Only the end of a big file is read; the line it was cut in is dropped.
+        let mut big = "y".repeat(2 * TAIL_BYTES as usize);
+        big.push_str("\nError: the last words\n");
+        std::fs::write(&p, big).unwrap();
+        assert_eq!(tail(&p, 0, 20), ["Error: the last words"]);
+    }
+
+    #[test]
+    fn goose_runs_quiet_so_it_does_not_print_the_event_values() {
+        let dir = temp("cfg").parent().unwrap().to_path_buf();
+        std::fs::write(dir.join("r.yaml"), "title: t\n").unwrap();
+        let cfg = Config::parse(
+            "rules:\n  - {name: form, webhook: true, recipe: r.yaml}\nwebhook: {secret: 0123456789abcdef}\n",
+            &dir.join("c.yaml"),
+        )
+        .unwrap();
+        let ctx = Ctx {
+            cfg: Arc::new(cfg),
+            exe: PathBuf::from("/usr/bin/goose-triggers"),
+            db: dir.join("state.db"),
+        };
+        let run = Run {
+            id: 7,
+            rule: "form".into(),
+            event_id: 1,
+            state: state::QUEUED.into(),
+            recipe: dir.join("r.yaml").to_string_lossy().into_owned(),
+            params: vec![("name".into(), "Test Person".into())],
+            holds: vec!["shell".into()],
+            working_dir: dir.to_string_lossy().into_owned(),
+            provider: None,
+            model: None,
+            max_turns: None,
+            session_id: Some("20261106_7".into()),
+            pid: None,
+            error: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        for mode in [Mode::Start, Mode::Resume("go on".into())] {
+            let stderr = File::create(dir.join("7.stderr")).unwrap();
+            let cmd = goose_command(&ctx, &run, &mode, &dir, stderr).unwrap();
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(args.iter().any(|a| a == "--quiet"), "{args:?}");
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "--output-format" && w[1] == "stream-json"),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]

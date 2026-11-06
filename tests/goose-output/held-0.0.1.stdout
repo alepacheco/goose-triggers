@@ -1,0 +1,9 @@
+   order: A-1001
+
+    __( O)>  ● new session · openai goose-triggers-selftest
+   \____)    20261106_2 · /tmp/goose-triggers-selftest-251-1793927080/work/webhook
+     L L     goose is ready
+{"type":"message","message":{"id":"selftest","role":"assistant","created":1793927083,"content":[{"type":"toolRequest","id":"call_5","toolCall":{"status":"success","value":{"name":"shell","arguments":{"command":"echo 'order A-1001' >> selftest-orders.txt"}}},"_meta":{"goose.toolCall.providerIndex":0,"goose_extension":"developer"}}],"metadata":{"userVisible":true,"agentVisible":true,"inference":{"provider":"openai","requestedModel":"goose-triggers-selftest"},"operations":{"llm":{"advertised_tools":["analyze","edit","load_skill","read_image","shell","tree","write"]}}}}}
+{"type":"message","message":{"id":"msg_a56868a0-18fe-4c97-96a3-0ecc8b48636e","role":"user","created":1793927083,"content":[{"type":"toolResponse","id":"call_5","toolResult":{"status":"error","error":"-32603: Tool call denied by policy hook `goose-triggers`: goose-triggers held this call (shell {\"command\":\"echo 'order A-1001' >> selftest-orders.txt\"}) for the user's approval. Do not retry it and do not try another way: end your turn now. If the user approves, you will be asked to make the call again.. Do not retry; this is a policy denial, not a transient failure."}}],"metadata":{"userVisible":true,"agentVisible":true}}}
+Yes — what would you like me to do?{"type":"error","error":"Headless run interrupted"}
+

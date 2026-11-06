@@ -216,22 +216,18 @@ pub fn log(cfg: &Config, run: Option<i64>) -> Result<()> {
     if let Ok(f) = std::fs::File::open(&out) {
         println!("\ngoose ({}):", out.display());
         for line in BufReader::new(f).lines().map_while(Result::ok) {
-            match serde_json::from_str::<Value>(&line) {
-                Ok(v) => {
-                    for d in describe(&v) {
-                        println!("  {d}");
-                    }
-                }
+            let (text, event) = crate::runner::split_line(&line);
+            if !text.is_empty() {
                 // goose's own messages, such as an error before the run started.
-                Err(_) if line.to_ascii_lowercase().contains("error") => {
-                    println!("  goose said: {}", short(line.trim(), 300));
-                }
-                Err(_) => {}
+                println!("  goose printed: {}", short(text, 300));
+            }
+            for d in event.iter().flat_map(describe) {
+                println!("  {d}");
             }
         }
     }
     let err = cfg.runs_dir().join(format!("{id}.stderr"));
-    let tail = crate::runner::tail(&err, 15);
+    let tail = crate::runner::tail(&err, 0, 15);
     if !tail.is_empty() {
         println!("\ngoose's stderr, last lines ({}):", err.display());
         for l in tail {

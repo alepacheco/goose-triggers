@@ -32,12 +32,12 @@ Run states: `queued`, `running`, `held`, `approved` (waiting to resume), `done`,
 From the release (a static binary). It goes in `~/.local/bin`, which must be on your PATH: the `export` line adds it for this shell (add it to your shell's profile to keep it).
 
 ```sh
-curl -fsSLO https://github.com/alepacheco/goose-triggers/releases/download/v0.0.1/goose-triggers-v0.0.1-x86_64-linux.tar.gz
-curl -fsSLO https://github.com/alepacheco/goose-triggers/releases/download/v0.0.1/goose-triggers-v0.0.1-x86_64-linux.tar.gz.sha256
-sha256sum -c goose-triggers-v0.0.1-x86_64-linux.tar.gz.sha256
-tar -xzf goose-triggers-v0.0.1-x86_64-linux.tar.gz
+curl -fsSLO https://github.com/alepacheco/goose-triggers/releases/download/v0.0.2/goose-triggers-v0.0.2-x86_64-linux.tar.gz
+curl -fsSLO https://github.com/alepacheco/goose-triggers/releases/download/v0.0.2/goose-triggers-v0.0.2-x86_64-linux.tar.gz.sha256
+sha256sum -c goose-triggers-v0.0.2-x86_64-linux.tar.gz.sha256
+tar -xzf goose-triggers-v0.0.2-x86_64-linux.tar.gz
 mkdir -p ~/.local/bin
-install -m 755 goose-triggers-v0.0.1-x86_64-linux/goose-triggers ~/.local/bin/
+install -m 755 goose-triggers-v0.0.2-x86_64-linux/goose-triggers ~/.local/bin/
 export PATH="$HOME/.local/bin:$PATH"
 goose-triggers --version
 ```
@@ -45,7 +45,7 @@ goose-triggers --version
 Or from source, with Rust 1.85 or newer (it installs to `~/.cargo/bin`):
 
 ```sh
-cargo install --locked --git https://github.com/alepacheco/goose-triggers --tag v0.0.1
+cargo install --locked --git https://github.com/alepacheco/goose-triggers --tag v0.0.2
 ```
 
 ## Check it works: selftest
@@ -62,7 +62,8 @@ The selftest runs the whole path with your goose binary and a scripted model ser
 4. goose-triggers is stopped and started again: both runs are still held, their calls stored;
 5. `approve` resumes the first run in the same goose session, the approved call runs once, and the run is done;
 6. `approve` on the second run resumes it, its model makes a different call, which is held again; `reject` ends the run, and no held call ran;
-7. a webhook event whose value carries YAML that would add a command to the recipe is refused before goose runs anything.
+7. a webhook event whose value carries YAML that would add a command to the recipe is refused before goose runs anything;
+8. a run that goose fails (its rule names a provider goose does not have) is marked failed with goose's own reason, and none of the event's values in it.
 
 Pass `--goose <path>` to test another goose binary, `--keep` to keep the temporary folder.
 
@@ -79,7 +80,7 @@ Pass `--goose <path>` to test another goose binary, `--keep` to keep the tempora
    ```sh
    mkdir -p ~/.config/goose-triggers/recipes ~/Inbox
    cd ~/.config/goose-triggers
-   base=https://raw.githubusercontent.com/alepacheco/goose-triggers/v0.0.1/examples
+   base=https://raw.githubusercontent.com/alepacheco/goose-triggers/v0.0.2/examples
    curl -fsSL -o config.yaml "$base/config.yaml"
    curl -fsSL -o recipes/file-note.yaml "$base/recipes/file-note.yaml"
    curl -fsSL -o recipes/form-entry.yaml "$base/recipes/form-entry.yaml"
@@ -127,13 +128,13 @@ Pass `--goose <path>` to test another goose binary, `--keep` to keep the tempora
    ```sh
    goose-triggers status        # held runs show the call they wait on
    goose-triggers log 3         # one run: its event, held calls in full, timeline and goose's messages
-   goose-triggers approve 3     # shows the call, asks, and resumes run 3; that exact call may run once
+   goose-triggers approve 3     # shows the call, asks, and records the approval; `goose-triggers run` then resumes run 3, and that exact call may run once
    goose-triggers reject 3      # end run 3
    ```
 
    A run's goose session is an ordinary goose session: `goose session list` shows it (named `goose-triggers <rule> run <n>`), and you can open it with `goose session --resume --session-id <id>`.
 
-To see held runs without a model provider, keep the selftest's folder and look at it: `goose-triggers selftest --keep`, then `goose-triggers -c <its folder>/config.yaml status --all` and `log 1`.
+To see runs that were held, and their calls, without a model provider, keep the selftest's folder and look at it: `goose-triggers selftest --keep`, then `goose-triggers -c <its folder>/config.yaml status --all` and `log 1`.
 
 ## Config reference
 
@@ -163,7 +164,7 @@ The fields an event gives; a recipe gets those it declares as parameters, by the
 - Folder events: `file_path` (the full path), `file_name`, `folder`.
 - Webhook events: each top-level field of a JSON object body (text as it is; numbers, booleans, arrays and objects as JSON text), and `body`, the whole body as text (unless the JSON has its own `body` field). The body may be up to 64 KiB.
 
-The webhook answers `202 {"event": <id>, "run": <id>}`, `401` for a missing or wrong secret, `404` for no webhook rule of that name, `405` for anything but POST, `413` for a body over 64 KiB, `411` for a chunked body (send a `Content-Length`), `408` for a request that does not arrive whole within 10 seconds. `GET /health` answers `200`. A `202` means the event is stored and its run queued; a run whose event lacks a parameter the recipe needs then fails at once, and `status` says why.
+The webhook answers `202 {"event": <id>, "run": <id>}`, `401` for a missing or wrong secret, `404` for a path that is not `/hooks/<name of a webhook rule>`, `405` for a method other than POST on a webhook rule's path, `413` for a body over 64 KiB, `411` for a chunked body (send a `Content-Length`), `408` for a request that does not arrive whole within 10 seconds. `GET /health` answers `200`. A `202` means the event is stored and its run queued; a run whose event lacks a parameter the recipe needs then fails at once, and `status` says why.
 
 ## Commands
 
@@ -200,7 +201,7 @@ cargo build --locked --release --target x86_64-unknown-linux-musl
 - You decide on holds from the command line; there are no notifications yet. The config is read when `goose-triggers run` starts.
 - The hold depends on goose loading goose-triggers' plugin from the working folder. Before each run, goose-triggers rewrites the plugin and checks goose's settings for a disabled one. If goose runs a tool the hook did not see, the run is stopped and marked failed, but that tool has already run.
 - A run stopped while it is going (goose-triggers stopped, or goose failed) is marked failed and not retried, except a resumed run that had not yet made its approved call: it resumes again.
-- A run has no time limit of its own: set `max_turns` on a rule to bound it.
+- A run has no time limit of its own. `max_turns` on a rule bounds the model's turns, not time: a tool call that hangs keeps its run going, and one of the `max_concurrent_runs` places taken, until goose-triggers is stopped.
 - goose is stopped with SIGINT. If it has not stopped 5 seconds later it gets SIGTERM and then SIGKILL, and a command it had started may then keep running.
 - Event values and approved calls go to goose on its command line, which other users of the machine can see in the process list.
 - A value that only fills in text is checked by its place in the recipe, not by what it says: a rule's recipe still reads event content, which may carry instructions for the model. That is what holds are for.
