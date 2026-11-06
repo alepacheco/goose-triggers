@@ -579,8 +579,10 @@ impl Selftest {
         self.check(
             log.contains("approved call made")
                 && log.contains(DONE_TEXT)
-                && log.contains("goose's stderr, last lines")
-                && log.contains("Headless run interrupted"),
+                // The stderr section comes last.
+                && log
+                    .split_once("goose's stderr, last lines")
+                    .is_some_and(|(_, s)| s.contains("Error: Headless run interrupted")),
             "goose-triggers log shows the run's story, goose's stderr included (goose stopped at the hold)",
         )?;
         self.stop_daemon()?;
