@@ -344,13 +344,29 @@ fn run_goose(ctx: &Ctx, run: &Run, mode: &Mode) -> Result<()> {
     std::fs::create_dir_all(&wd).with_context(|| format!("creating {}", wd.display()))?;
     prepare_working_dir(ctx, run, &wd)?;
     if let Mode::Start = mode {
-        let rendered = crate::recipe::check_values_stay_text(
+        let rendered = match crate::recipe::check_values_stay_text(
             &ctx.cfg.goose,
             Path::new(&run.recipe),
             &run.params,
             &wd,
             hidden_env(ctx),
-        )?;
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(b) = e.downcast_ref::<crate::recipe::ValuesBreakRecipe>() {
+                    // Not the failure reason, as it may quote the event's values: the log
+                    // shows it beside the event.
+                    store.log(
+                        Some(run.id),
+                        &format!(
+                            "goose's error rendering the recipe with the event's values: {}",
+                            b.goose_said
+                        ),
+                    )?;
+                }
+                return Err(e);
+            }
+        };
         if !run.holds.is_empty() && run.provider.is_none() {
             if let Some(p) = crate::recipe::rendered_provider(&rendered) {
                 if is_cli_agent_provider(&p) {

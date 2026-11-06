@@ -466,6 +466,12 @@ impl Selftest {
             )
         })?;
         let error = r.error.unwrap_or_default();
+        let log = self.cli(&["log", &fail_run.to_string()])?;
+        self.check(
+            log.lines()
+                .any(|l| l.contains("goose printed: ") && l.contains(MISSING_PROVIDER)),
+            &format!("goose-triggers log {fail_run} shows what goose printed: its error"),
+        )?;
         // goose printed none of the event's values either (it runs with --quiet).
         let printed = ["jsonl", "stderr"].iter().any(|ext| {
             std::fs::read_to_string(self.dir.join(format!("state/runs/{fail_run}.{ext}")))
@@ -514,13 +520,17 @@ impl Selftest {
             })?;
             refused.push((run, r.state, r.session_id, r.error.unwrap_or_default()));
         }
+        let goose_error_logged = self
+            .cli(&["log", &refused[0].0.to_string()])?
+            .contains("goose's error rendering the recipe with the event's values");
         self.check(
             refused.iter().all(|(_, st, sid, e)| {
                 st == state::FAILED && sid.is_none() && !e.is_empty() && !e.contains(chosen)
             }) && refused[0].3.contains("breaks it")
-                && refused[1].3.contains("parameter(s) order"),
+                && refused[1].3.contains("parameter(s) order")
+                && goose_error_logged,
             &format!(
-                "runs {} and {}: an event whose value breaks the recipe, and one without its parameter, failed before goose ran, their reasons without the sender's text",
+                "runs {} and {}: an event whose value breaks the recipe, and one without its parameter, failed before goose ran, their reasons without the sender's text (goose's own error in the first one's log)",
                 refused[0].0, refused[1].0
             ),
         )?;

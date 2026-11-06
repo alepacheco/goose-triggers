@@ -144,14 +144,52 @@ pub fn check_values_stay_text(
             "goose cannot read the recipe, even with placeholder values ({e:#}); the run was not started"
         )
     })?;
-    let Ok(real) = real else {
-        bail!("with the event's values goose cannot read the recipe, which it reads with other values: a value carries YAML or JSON syntax that breaks it; the run was not started");
+    let real = match real {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(match e.downcast::<RenderFailed>() {
+                Ok(RenderFailed(goose_said)) => ValuesBreakRecipe { goose_said }.into(),
+                // goose-triggers' own error (goose did not start, or took too long): no value in it.
+                Err(e) => e.context(
+                    "goose could not render the recipe with the event's values; the run was not started",
+                ),
+            });
+        }
     };
     if !same_recipe(&real, &template, &tokens) {
         bail!("the event's values would change the recipe itself, not only fill in its text (a value carries YAML or JSON syntax, or fills in a field other than {}); the run was not started", TEXT_FIELDS.join(", "));
     }
     Ok(real)
 }
+
+/// goose's own output when it could not render a recipe, which may quote the values it was
+/// given.
+#[derive(Debug)]
+struct RenderFailed(String);
+
+impl std::fmt::Display for RenderFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RenderFailed {}
+
+/// goose cannot render the recipe with the event's values, though it can with placeholders.
+/// Its text, the run's failure reason, quotes nothing of the event; goose's own error, which
+/// may, is kept apart for the run's timeline.
+#[derive(Debug)]
+pub struct ValuesBreakRecipe {
+    pub goose_said: String,
+}
+
+impl std::fmt::Display for ValuesBreakRecipe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("with the event's values goose cannot read the recipe, which it reads with placeholder values, so a value breaks it (by its YAML or JSON syntax, say); goose's error is in the run's log; the run was not started")
+    }
+}
+
+impl std::error::Error for ValuesBreakRecipe {}
 
 /// The provider a rendered recipe asks for.
 pub fn rendered_provider(recipe: &serde_yaml_ng::Value) -> Option<String> {
@@ -236,9 +274,10 @@ fn render(
             String::from_utf8_lossy(&out),
             String::from_utf8_lossy(&err)
         );
-        bail!("{}", crate::util::short(text.trim(), 300));
+        return Err(RenderFailed(crate::util::short(text.trim(), 300)).into());
     }
-    Ok(serde_yaml_ng::from_slice(&out)?)
+    serde_yaml_ng::from_slice(&out)
+        .map_err(|e| RenderFailed(format!("goose's rendered recipe is not YAML: {e}")).into())
 }
 
 /// The recipe fields an event's value may fill in: text the model reads, nothing goose runs
