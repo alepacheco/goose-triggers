@@ -1,0 +1,11 @@
+# goose-triggers 0.0.1: automated code review of the 0.0.1 change (2be6979..f313c83), 6 November 2026
+
+By an automated reviewer, after 0.0.1 was released, reading the diff, the code around it and goose's source; no build. Its findings were fixed in 0.0.2.
+
+Verdict: fit for release once item 1 is fixed. The change weakens no hold: `done` needs the same conditions as before, held/unseen-call returns still come first, approve path untouched, new output passes through short/clean, webhook secret still kept from goose's env.
+
+1. Major, src/runner.rs:451-458, 618-633; src/commands.rs:226. goose-triggers does not pass `--quiet`, so goose prints recipe parameters (`   key: value`) and its banner on stdout: the "goose said" reason is almost always the banner or event values, and the stderr tail fallback is almost never read. A crash after the banner reports banner text; a failure before it starts with event values, cut at 300 (status shows 100), so a sender chooses the stated reason; a parameter line containing "error" shows as goose's words in `log`. Fix: add `--quiet` in goose_command (in goose 1.57 quiet only gates print_recipe_info and display_session_info); keep the last 300 characters of the reason, not the first.
+2. Minor, src/runner.rs:624-627: `<id>.stderr` is appended across the first start and each resume, so the tail can quote an earlier process (e.g. "Headless run interrupted" from the stop at the hold). Fix: note the file length before spawning, tail only what this process wrote.
+3. Minor, src/runner.rs:556-565: `tail` uses read_to_string, so invalid UTF-8 gives an empty tail and `log` hides that stderr has content; also reads the whole file. Fix: from_utf8_lossy on the last few KiB.
+4. Minor: no test covers `said`, `tail` or the new order in `finish`; a unit test fed a kept run log (a kept selftest folder's state/runs/1.jsonl) would have caught item 1.
+5. Minor, README: "To see held runs without a model provider, keep the selftest's folder" (no run is held at the end of selftest: say "runs that were held and their calls"); "approve 3 ... and resumes run 3" (approve records the approval; the running daemon resumes); "405 for anything but POST" (only on an existing rule's path; others 404); "set max_turns ... to bound it" (bounds model turns, not time: a hung tool keeps a max_concurrent_runs slot).

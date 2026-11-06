@@ -1,0 +1,87 @@
+name: Release install
+
+# Each published release, installed on a fresh runner exactly as its README's Install section
+# says (the block is read from the README at the release's tag and run as it is), its tarball
+# checked against the sha256 file and against the digest GitHub lists for the asset, then the
+# selftest run with goose's latest CLI release. Run by hand for an earlier release with its tag.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The release tag to check (v0.0.4)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+
+      - name: The README's Install block at ${{ env.TAG }}
+        run: |
+          set -euo pipefail
+          # The first sh block after "## Install", up to its closing fence.
+          awk '/^## Install/{f=1} f&&/^```sh$/{b=1; next} b&&/^```$/{exit} b' README.md > "$RUNNER_TEMP/install.sh"
+          cat "$RUNNER_TEMP/install.sh"
+          grep -q "releases/download/$TAG/" "$RUNNER_TEMP/install.sh"
+
+      - name: The release's assets as GitHub lists them
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The release's assets may still be uploading when it is published: wait for them.
+          name="goose-triggers-$TAG-x86_64-linux.tar.gz"
+          for i in $(seq 1 30); do
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/releases/tags/$TAG" > "$RUNNER_TEMP/release.json"
+            digest=$(jq -r --arg n "$name" '.assets[] | select(.name == $n and .state == "uploaded") | .digest' "$RUNNER_TEMP/release.json")
+            sums=$(jq -r --arg n "$name.sha256" '[.assets[] | select(.name == $n and .state == "uploaded")] | length' "$RUNNER_TEMP/release.json")
+            if [ -n "$digest" ] && [ "$sums" = 1 ]; then break; fi
+            sleep 10
+          done
+          [ -n "$digest" ] || { echo "the release has no $name" >&2; exit 1; }
+          echo "GitHub lists $name with $digest"
+          echo "DIGEST=${digest#sha256:}" >> "$GITHUB_ENV"
+
+      - name: Install the goose CLI (latest release, checked against its listed digest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-3 libxcb1
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/aaif-goose/goose/releases/latest > "$RUNNER_TEMP/goose.json"
+          tag=$(jq -er .tag_name "$RUNNER_TEMP/goose.json")
+          digest=$(jq -er '.assets[] | select(.name == "goose-x86_64-unknown-linux-gnu.tar.bz2") | .digest' "$RUNNER_TEMP/goose.json")
+          curl -fsSL -o "$RUNNER_TEMP/goose.tar.bz2" \
+            "https://github.com/aaif-goose/goose/releases/download/$tag/goose-x86_64-unknown-linux-gnu.tar.bz2"
+          echo "${digest#sha256:}  $RUNNER_TEMP/goose.tar.bz2" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/goose" "$HOME/.local/bin"
+          tar -xjf "$RUNNER_TEMP/goose.tar.bz2" -C "$RUNNER_TEMP/goose"
+          find "$RUNNER_TEMP/goose" -name goose -type f -exec install -m 755 {} "$HOME/.local/bin/goose" \;
+          "$HOME/.local/bin/goose" --version
+
+      - name: Install ${{ env.TAG }} as the README says, then the selftest
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/user" && cd "$RUNNER_TEMP/user"
+          bash -euxo pipefail "$RUNNER_TEMP/install.sh"
+          tarball="goose-triggers-$TAG-x86_64-linux.tar.gz"
+          echo "$DIGEST  $tarball" | sha256sum -c -
+          export PATH="$HOME/.local/bin:$PATH"
+          test "$(goose-triggers --version)" = "goose-triggers ${TAG#v}"
+          goose-triggers selftest
