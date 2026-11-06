@@ -74,11 +74,14 @@ enum Cmd {
         #[arg(long)]
         keep: bool,
     },
-    /// Run hostile events (injected instructions in webhook fields and files) against the example rules' recipes, with no holds and with their holds, a scripted model obeying every injection; no API key needed
+    /// Run hostile events (injected instructions in webhook fields and files) against the example rules' recipes, with no holds and with their holds; a scripted model makes every call the injections name; no API key needed
     HostileSuite {
         /// The goose binary to test with [default: goose on PATH]
         #[arg(long, value_name = "PATH")]
         goose: Option<PathBuf>,
+        /// The holds of the second pass, comma-separated [default: shell,write,edit,read_image, the example rules']
+        #[arg(long, value_name = "TOOLS")]
+        holds: Option<String>,
         /// Keep the suite's temporary folder even when every result is as expected
         #[arg(long)]
         keep: bool,
@@ -93,11 +96,10 @@ fn main() -> ExitCode {
     if let Cmd::Hook = cli.command {
         return ExitCode::from(hook::main_hook());
     }
-    if let Cmd::Status { .. } | Cmd::Log { .. } | Cmd::Approve { .. } | Cmd::Reject { .. } =
-        cli.command
-    {
-        // These print for a reader that may stop reading (`status | head`): end quietly then,
-        // as other command-line tools do, rather than fail on the closed pipe.
+    if let Cmd::Status { .. } | Cmd::Log { .. } = cli.command {
+        // These only print, for a reader that may stop reading (`status | head`): end quietly
+        // then, as other command-line tools do, rather than fail on the closed pipe. approve
+        // and reject decide first and print on regardless.
         // SAFETY: restores the default action of one signal before any thread starts.
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -114,7 +116,7 @@ fn main() -> ExitCode {
         Cmd::Reject { run } => config::Config::load_for_state(cli.config.as_deref())
             .and_then(|c| commands::reject(&c, run)),
         Cmd::Selftest { goose, keep } => selftest::run(goose, keep),
-        Cmd::HostileSuite { goose, keep } => hostile::run(goose, keep),
+        Cmd::HostileSuite { goose, holds, keep } => hostile::run(goose, holds, keep),
         Cmd::Hook => unreachable!(),
     };
     match result {

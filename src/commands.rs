@@ -244,6 +244,15 @@ pub fn log(cfg: &Config, run: Option<i64>) -> Result<()> {
     Ok(())
 }
 
+/// A line of approve's or reject's output. Their decision does not hang on it: a reader that
+/// went away (`approve 3 --yes | head -1`) does not stop or undo it.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
 fn refuse_inside_a_run() -> Result<()> {
     if std::env::var_os(crate::hook::ENV_RUN).is_some() {
         bail!("refusing to decide on a hold from inside a goose-triggers run");
@@ -260,29 +269,33 @@ pub fn approve(cfg: &Config, run: i64, yes: bool) -> Result<()> {
             Some(r) => bail!("run {run} is {}, not held", r.state),
         }
     };
-    println!("run {run} waits on {} with input", clean(&shown.tool_name));
-    println!("{}", indent(&full_call(&shown.tool_input), "  "));
+    say!("run {run} waits on {} with input", clean(&shown.tool_name));
+    say!("{}", indent(&full_call(&shown.tool_input), "  "));
     // SAFETY: isatty only inspects a file descriptor.
     let interactive = unsafe { libc::isatty(0) } == 1;
     if !interactive && !yes {
         bail!("not approved: there is no terminal to ask on; pass --yes to approve run {run} without being asked");
     }
     if !yes {
-        print!("Approve this call? [y/N] ");
-        std::io::Write::flush(&mut std::io::stdout())?;
+        {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = write!(out, "Approve this call? [y/N] ");
+            let _ = out.flush();
+        }
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         if !matches!(answer.trim(), "y" | "Y" | "yes") {
-            println!("not approved; the run stays held");
+            say!("not approved; the run stays held");
             return Ok(());
         }
     }
     store.approve_call(run, shown.id)?;
-    println!("run {run}: approved");
+    say!("run {run}: approved");
     if crate::daemon::is_running(&cfg.state_dir) {
-        println!("goose-triggers resumes its goose session now; that exact call may run once.");
+        say!("goose-triggers resumes its goose session now; that exact call may run once.");
     } else {
-        println!("goose-triggers run is not running: the run resumes once it starts.");
+        say!("goose-triggers run is not running: the run resumes once it starts.");
     }
     Ok(())
 }
@@ -296,7 +309,7 @@ pub fn reject(cfg: &Config, run: i64) -> Result<()> {
     } else {
         "rejected"
     };
-    println!(
+    say!(
         "run {run}: {what} {} {}; the run has ended",
         clean(&call.tool_name),
         call_line(&call.tool_input, 200)

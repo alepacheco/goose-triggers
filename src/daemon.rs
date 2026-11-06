@@ -190,13 +190,13 @@ fn check_rule(rule: &Rule, exe: &Path) -> Result<()> {
                 rule.name
             );
         }
-        let unheld: Vec<&str> = ["shell", "write", "edit"]
+        let unheld: Vec<&str> = ["shell", "write", "edit", "read_image"]
             .into_iter()
             .filter(|t| !matches_hold(&rule.hold, t))
             .collect();
         if !unheld.is_empty() {
             say(&format!(
-                "warning: rule {} holds {:?} but not {}: a run can run commands or write files through those, so it could do what a held tool does",
+                "warning: rule {} holds {:?} but not {}: a run can run commands, write files or fetch URLs (read_image loads http addresses) through those, so it could do what a held tool does",
                 rule.name,
                 rule.hold,
                 unheld.join(", ")

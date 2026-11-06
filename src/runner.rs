@@ -460,21 +460,21 @@ fn run_goose(ctx: &Ctx, run: &Run, mode: &Mode) -> Result<()> {
             return Err(e);
         }
     };
+    store.set_pid(run.id, None)?;
     // goose has exited: whether its hooks recorded the run's session is settled.
     let hook_session = store.run(run.id)?.is_some_and(|r| r.session_id.is_some());
     if matches!(mode, Mode::Start) && !hook_session {
         // goose may have made the session and ended before the hooks ran: name it anyway, so
-        // the user can open it.
+        // the user can open it. Only a help: a store error here does not change the outcome.
         if let Some(sid) = find_session(ctx, run, &wd, started) {
-            if store.set_session_if_unset(run.id, &sid)? {
-                store.log(
+            if store.set_session_if_unset(run.id, &sid).unwrap_or(false) {
+                let _ = store.log(
                     Some(run.id),
                     &format!("goose session {sid} (found by its name: goose ended before goose-triggers' hooks ran)"),
-                )?;
+                );
             }
         }
     }
-    store.set_pid(run.id, None)?;
     let stderr = tail(
         &runs_dir.join(format!("{}.stderr", run.id)),
         stderr_from,
@@ -789,7 +789,7 @@ fn finish(
     }
     if !hook_session {
         return fail(&format!(
-            "goose did not run goose-triggers' plugin hooks (no session was recorded); check that goose loads plugins from {}",
+            "goose did not run goose-triggers' plugin hooks (they recorded no session); check that goose loads plugins from {}",
             wd.join(".agents/plugins").display()
         ));
     }

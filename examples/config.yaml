@@ -18,19 +18,20 @@ webhook:
 
 rules:
   # A new PDF in ~/Inbox starts recipes/file-note.yaml with the file's name and path.
-  # goose may read and list freely; writing a file or running a command waits for approval.
+  # Running a command, writing or editing a file, and loading an image (read_image also
+  # loads http addresses, so it can send data out) wait for approval.
   - name: inbox-notes
     folder: ~/Inbox
     pattern: "*.pdf"
     recipe: recipes/file-note.yaml
-    hold: [shell, write, edit]
+    hold: [shell, write, edit, read_image]
 
   # POST http://127.0.0.1:8787/hooks/form-entry starts recipes/form-entry.yaml with the
   # JSON body's top-level fields as parameters.
   - name: form-entry
     webhook: true
     recipe: recipes/form-entry.yaml
-    hold: [shell, write, edit]
+    hold: [shell, write, edit, read_image]
     # Optional: the folder goose works in (default: <state_dir>/work/<rule name>),
     # and the provider, model and turn limit for this rule's runs.
     # working_dir: ~/forms

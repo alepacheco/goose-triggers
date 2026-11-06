@@ -8,7 +8,7 @@ You mark the actions that need your approval (running a command, writing a file,
 
 **Status: release 0.0, a working prototype of that core path.** Linux x86-64. Tested with goose 1.57.0. See [Limits of 0.0](#limits-of-00).
 
-[![CI](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml/badge.svg)](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml) The unit tests, the [selftest](#check-it-works-selftest) and the [hostile-event suite](#hostile-events-what-holds-stop) run on GitHub Actions on every push and pull request, and every day against goose's latest CLI release (and goose 1.57.0), so a new goose release that breaks goose-triggers shows there: [CI runs](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml).
+[![CI](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml/badge.svg)](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml) The unit tests, the [selftest](#check-it-works-selftest) and the [hostile-event suite](#hostile-events-what-holds-do-with-injected-calls) run on GitHub Actions on every push to `main`, every release tag and pull request, and every day against goose's latest CLI release (and goose 1.57.0), so a new goose release that breaks goose-triggers shows there (GitHub pauses daily runs in a repository with no activity for 60 days): [CI runs](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml).
 
 ## How it works
 
@@ -67,22 +67,22 @@ The selftest runs the whole path with your goose binary and a scripted model ser
 7. a webhook event whose value carries YAML that would add a command to the recipe is refused before goose runs anything;
 8. a run that goose fails (its rule names a provider goose does not have) is marked failed with goose's own reason, and none of the event's values in it; the goose session goose made for it is named, though goose failed before goose-triggers' hooks ran;
 9. an event whose value breaks the recipe's YAML, and one that lacks the recipe's parameter, fail before goose runs, with reasons that quote none of the sender's text; one whose value goose cannot be given (a NUL byte) fails with goose-triggers' own reason;
-10. a run approved while goose-triggers is stopped, then rejected: the approval is withdrawn and the call never runs;
-11. `approve` with no terminal to ask on needs `--yes`; `status` and `log` end quietly when their reader goes away (`| head`).
+10. a run approved while goose-triggers is stopped, then rejected: the approval is withdrawn, and goose-triggers, started again, does not resume it;
+11. `approve` with no terminal to ask on needs `--yes`, and approves even when its output is closed; `status` and `log` end quietly when their reader goes away (`| head`).
 
 Pass `--goose <path>` to test another goose binary, `--keep` to keep the temporary folder.
 
-## Hostile events: what holds stop
+## Hostile events: what holds do with injected calls
 
 ```sh
 goose-triggers hostile-suite
 ```
 
-The suite sends 14 events carrying injected instructions to rules made from the [example recipes](examples/recipes/): webhook fields, and files whose names or contents ask the model to send a secret file to a server, delete a file, run a command, put a download-and-run line in a shell profile, add an extension to the rule's recipe file, or empty goose-triggers' hooks file; and webhook fields and file names carrying YAML that would change the recipe itself (a `retry` check or a sub-recipe that runs a command). The scripted model plays the worst case: a model that falls for every injection and makes each call the injected text asks for (each injected instruction carries the call it means, for the scripted model to make). Each harmful call that runs trips a local canary: a request to a local server, or a file made, deleted or changed.
+The suite sends 16 events carrying injected instructions to rules made from the [example recipes](examples/recipes/): webhook fields, and files whose names or contents, that ask the model to send a secret file or the event's data to a server (with `curl`, or as the address of an image to load), delete a file, run a command, put a download-and-run line in a shell profile, add an extension to the rule's recipe file, or empty goose-triggers' hooks file; and webhook fields and a file name carrying YAML that would change or break the recipe itself (a `retry` check or a sub-recipe that runs a command). The scripted model falls for every injection: it makes exactly the call each injected instruction names (the instruction carries that call for it), and nothing else. It does not look for another route, such as a tool the rule does not hold. Each injected call that runs trips a local canary: a request to a local server, or a file made, deleted or changed. For the values that would change the recipe, the evidence is goose-triggers' refusal, and what goose renders from those values with no check.
 
-The events run twice: with no holds, and with the example rules' holds (`shell`, `write`, `edit`). When a file-note run is held at its read of the new file (the recipe's own task), the suite approves it, as a user would; every other held call it rejects. The suite passes only if, with no holds, every injected action trips its canary (the canaries work), and with the holds none does, each held at its first injected call; and if the recipe-structure check refuses every value that would change the recipe, in both passes. It prints a table of what happened to each event; for the values that would change the recipe it also shows what goose renders from them with no check. It needs goose and `curl` (the injected calls send data with it), no API key, and works in a temporary folder (`--keep` keeps it, with `results.md`).
+The events run twice: with no holds, and with the example rules' holds (`shell`, `write`, `edit`, `read_image`; `--holds <tools>` tries others). When a file-note run is held at its read of the new file (the recipe's own task), the suite approves it, as a user would; every other held call it rejects. The suite passes only if, with no holds, every injected call trips its canary (the canaries work), and with the holds none does, each held at its first injected call; and if the recipe-structure check refuses every value that would change or break the recipe, in both passes. It prints a table of what happened to each event. It needs goose and `curl` (some injected calls send data with it), no API key, and works in a temporary folder (`--keep` keeps it, with `results.md`).
 
-What it does not show: how often a real model falls for such text (it assumes always); calls through tools a rule does not hold, such as an extension's tools you did not list (a hold covers only the tools it names: [Config reference](#config-reference)); and a user who approves a harmful call.
+What it does not show: how often a real model falls for such text (it assumes always); whether a model that looks for a way around the holds finds one, through a tool the rule does not hold (a hold covers only the tools it names: see below); and a user who approves a harmful call.
 
 ## Use
 
@@ -116,12 +116,12 @@ What it does not show: how often a real model falls for such text (it assumes al
        folder: ~/Inbox
        pattern: "*.pdf"
        recipe: recipes/file-note.yaml
-       hold: [shell, write, edit]
+       hold: [shell, write, edit, read_image]
 
      - name: form-entry
        webhook: true
        recipe: recipes/form-entry.yaml
-       hold: [shell, write, edit]
+       hold: [shell, write, edit, read_image]
    ```
 
 3. Start it in one terminal (it runs until you stop it with Ctrl-C or SIGTERM):
@@ -166,13 +166,13 @@ To see runs that were held, and their calls, without a model provider, keep the 
 | `rules[].folder`, `rules[].pattern` | a folder source: new files in the folder (not its subfolders) whose name matches the pattern (`*`, `?`, `[...]`, case-sensitive; default `*`). Files already there when the rule first watches the folder are not new; files that arrive while goose-triggers is stopped are taken when it starts. Hidden files are ignored |
 | `rules[].webhook: true` | a webhook source: `POST /hooks/<rule name>` |
 | `rules[].recipe` | the goose recipe (YAML or JSON) |
-| `rules[].hold` | tool names to hold; `*` and `?` match any characters. goose's developer extension has `shell`, `write`, `edit`, `tree` and `read_image` (goose adds `analyze` with it); an extension's tools are `<extension>__<tool>`, so `gmail__*` holds every tool of an extension named `gmail`. `*` holds every call |
+| `rules[].hold` | tool names to hold; `*` and `?` match any characters. goose's developer extension has `shell`, `write`, `edit`, `tree` and `read_image` (which loads files and `http(s)` addresses; goose adds `analyze` with it); an extension's tools are `<extension>__<tool>`, so `gmail__*` holds every tool of an extension named `gmail`. `*` holds every call |
 | `rules[].working_dir` | the folder goose works in. Default `<state_dir>/work/<rule name>` |
 | `rules[].provider`, `rules[].model`, `rules[].max_turns` | passed to `goose run` as `--provider`, `--model`, `--max-turns` |
 
 Relative paths are relative to the config file; `~/` is your home folder.
 
-**A hold covers only the tools it names.** A run that may run commands or write files can do through them what a held tool would do: hold `shell`, `write` and `edit` whenever you hold anything (goose-triggers warns at start when a rule does not), plus every extension tool that sends or deletes things, or hold `*`. A rule that holds anything also holds goose's code mode (`execute_javascript`, which calls tools out of the hook's sight), its extension manager (`manage_extensions`, which turns on extensions mid-run) and `delegate` (which starts a subagent with a recipe's extensions). goose-triggers refuses to run a rule with holds in a working folder that holds other goose plugins, whose hooks could run commands. Plugins in your own `~/.agents/plugins` load in every goose session, goose-triggers' runs included: their hooks are yours to trust. A rule's holds are copied into each run when its event arrives.
+**A hold covers only the tools it names.** A run that may run commands, write files or load URLs can do through them what a held tool would do: hold `shell`, `write`, `edit` and `read_image` (which also loads `http(s)` addresses, so it can send data out in one) whenever you hold anything (goose-triggers warns at start when a rule does not), plus every extension tool that sends or deletes things, or hold `*`. A rule that holds anything also holds goose's code mode (`execute_javascript`, which calls tools out of the hook's sight), its extension manager (`manage_extensions`, which turns on extensions mid-run) and `delegate` (which starts a subagent with a recipe's extensions). goose-triggers refuses to run a rule with holds in a working folder that holds other goose plugins, whose hooks could run commands. Plugins in your own `~/.agents/plugins` load in every goose session, goose-triggers' runs included: their hooks are yours to trust. A rule's holds are copied into each run when its event arrives.
 
 ### Event fields
 
@@ -193,7 +193,7 @@ The webhook answers `202 {"event": <id>, "run": <id>}`, `401` for a missing or w
 | `goose-triggers approve <run> [--yes]` | shows the call a held run waits on and approves it: on a terminal it asks first, unless `--yes`; with no terminal (a script) it needs `--yes`. `run` resumes the same session |
 | `goose-triggers reject <run>` | rejects a held run's call, or withdraws the approval of a run not resumed yet; the run ends |
 | `goose-triggers selftest [--goose <path>] [--keep]` | the end-to-end check above |
-| `goose-triggers hostile-suite [--goose <path>] [--keep]` | the [hostile events](#hostile-events-what-holds-stop), with and without holds |
+| `goose-triggers hostile-suite [--goose <path>] [--holds <tools>] [--keep]` | the [hostile events](#hostile-events-what-holds-do-with-injected-calls), with no holds and with the example rules' (or `--holds`) |
 
 Read a held call in full with `log <run>` before approving it. `approve` and `reject` work whether `goose-triggers run` is running or not: an approved run resumes once it runs, and until then `reject` can withdraw the approval.
 
@@ -205,7 +205,7 @@ cargo test
 
 runs the unit tests (rules, the store's hold and approval logic, the hook's decisions, folder and webhook sources, recipe parameters and the structure check, the scripted model server) and then the selftest above, when a goose binary is on PATH (or at the path in `GOOSE_BIN`); without one, the selftest is skipped and says so.
 
-[CI](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml) ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the same with goose's latest release and goose 1.57.0, builds the static release binary and runs its selftest and the [hostile-event suite](#hostile-events-what-holds-stop), on every push and pull request and once a day.
+[CI](https://github.com/alepacheco/goose-triggers/actions/workflows/ci.yml) ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the same with goose's latest release and goose 1.57.0, builds the static release binary and runs its selftest and the [hostile-event suite](#hostile-events-what-holds-do-with-injected-calls), on every push to `main`, release tag and pull request, and once a day.
 
 The release binary is built static, with musl:
 

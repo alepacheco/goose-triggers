@@ -616,9 +616,23 @@ impl Harness {
         )?;
         let late_run = self.wait_state(WEBHOOK_RULE, state::HELD)?.id;
         self.stop_daemon()?;
-        self.cli(&["approve", &late_run.to_string(), "--yes"])?;
+        // approve decides even when its reader has gone away.
+        let approved = self
+            .command(&["approve", &late_run.to_string(), "--yes"])
+            .stdout(closed_pipe()?)
+            .output()?;
+        let approved = approved.status.success()
+            && self
+                .store()?
+                .run(late_run)?
+                .is_some_and(|r| r.state == state::APPROVED);
         let status = self.cli(&["status"])?;
         let out = self.cli(&["reject", &late_run.to_string()])?;
+        // goose-triggers starts again and does not resume the run.
+        self.start_daemon()?;
+        std::thread::sleep(Duration::from_secs(3));
+        self.stop_daemon()?;
+        let resumed = self.timeline_has(late_run, "goose resumed")?;
         let s = self.store()?;
         let r = s.run(late_run)?.context("run gone")?;
         let calls: Vec<String> = s.calls(late_run)?.into_iter().map(|c| c.state).collect();
@@ -627,14 +641,16 @@ impl Harness {
         let orders = std::fs::read_to_string(self.dir.join("work/webhook/selftest-orders.txt"))
             .unwrap_or_default();
         self.check(
-            status.contains("withdraws it")
+            approved
+                && !resumed
+                && status.contains("withdraws it")
                 && out.contains("withdrew the approval")
                 && r.state == state::REJECTED
                 && calls == ["rejected"]
                 && !open
                 && self.timeline_has(late_run, "approval withdrawn")?
                 && !orders.contains("A-3003"),
-            &format!("run {late_run} held, approved while goose-triggers was stopped, then rejected: the approval withdrawn, the run ended, the call never ran"),
+            &format!("run {late_run} held, approved while goose-triggers was stopped (approve's output closed), then rejected: the approval withdrawn, the run ended; goose-triggers started again and did not resume it, the call never ran"),
         )?;
 
         // status and log end quietly when their reader goes away (`status | head`).
@@ -737,7 +753,7 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
     let secret = format!("selftest-{}-{:x}", std::process::id(), crate::util::now());
     let config = dir.join("config.yaml");
     let cfg = format!(
-        "state_dir: {state}\ngoose: {goose}\nwebhook:\n  listen: {listen}\n  secret_env: {SECRET_ENV}\nrules:\n  - name: {FOLDER_RULE}\n    folder: {inbox}\n    pattern: \"*.txt\"\n    recipe: {folder}\n    hold: [shell, write, edit]\n    working_dir: {wf}\n  - name: {WEBHOOK_RULE}\n    webhook: true\n    recipe: {webhook}\n    hold: [shell, write, edit]\n    working_dir: {ww}\n  - name: {FAIL_RULE}\n    webhook: true\n    recipe: {webhook}\n    hold: [shell, write, edit]\n    provider: {MISSING_PROVIDER}\n    working_dir: {wx}\n",
+        "state_dir: {state}\ngoose: {goose}\nwebhook:\n  listen: {listen}\n  secret_env: {SECRET_ENV}\nrules:\n  - name: {FOLDER_RULE}\n    folder: {inbox}\n    pattern: \"*.txt\"\n    recipe: {folder}\n    hold: [shell, write, edit, read_image]\n    working_dir: {wf}\n  - name: {WEBHOOK_RULE}\n    webhook: true\n    recipe: {webhook}\n    hold: [shell, write, edit, read_image]\n    working_dir: {ww}\n  - name: {FAIL_RULE}\n    webhook: true\n    recipe: {webhook}\n    hold: [shell, write, edit, read_image]\n    provider: {MISSING_PROVIDER}\n    working_dir: {wx}\n",
         state = yaml_str(&dir.join("state")),
         goose = serde_json::to_string(&goose)?,
         inbox = yaml_str(&dir.join("inbox")),
