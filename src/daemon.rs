@@ -103,6 +103,11 @@ pub fn is_running(state_dir: &Path) -> bool {
 /// these too.
 pub const IMPLICIT_HOLDS: &[&str] = &["*execute_javascript", "*manage_extensions", "*delegate"];
 
+/// goose's developer tools through which a run can do what any held tool does (run a command,
+/// write a file, send data out by loading an address): a rule that holds anything should hold
+/// these, and goose-triggers warns at start when one does not.
+pub const RECOMMENDED_HOLDS: &[&str] = &["shell", "write", "edit", "read_image"];
+
 /// A run's hold patterns: the rule's, and the implicit ones when it has any.
 pub fn run_holds(rule_holds: &[String]) -> Vec<String> {
     let mut holds = rule_holds.to_vec();
@@ -190,8 +195,9 @@ fn check_rule(rule: &Rule, exe: &Path) -> Result<()> {
                 rule.name
             );
         }
-        let unheld: Vec<&str> = ["shell", "write", "edit", "read_image"]
-            .into_iter()
+        let unheld: Vec<&str> = RECOMMENDED_HOLDS
+            .iter()
+            .copied()
             .filter(|t| !matches_hold(&rule.hold, t))
             .collect();
         if !unheld.is_empty() {

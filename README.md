@@ -82,7 +82,7 @@ The suite sends 16 events carrying injected instructions to rules made from the 
 
 The events run twice: with no holds, and with the example rules' holds (`shell`, `write`, `edit`, `read_image`; `--holds <tools>` tries others). When a file-note run is held at its read of the new file (the recipe's own task), the suite approves it, as a user would; every other held call it rejects. The suite passes only if, with no holds, every injected call trips its canary (the canaries work), and with the holds none does, each held at its first injected call; if the recipe-structure check refuses every value that would change or break the recipe, in both passes; and if every tool goose offers the runs is held or one known to only read local files (`tree`, `analyze` and `load_skill` in goose 1.57.0), so a goose release that offers the example recipes a new tool fails it until the tool is looked at. It prints a table of what happened to each event, and the tools goose offered. It needs goose and `curl` (some injected calls send data with it), no API key, and works in a temporary folder (`--keep` keeps it, with `results.md`).
 
-What it does not show: how often a real model falls for such text (it assumes always); whether a model that looks for a way around the holds finds one, through a tool the rule does not hold (a hold covers only the tools it names: see below); and a user who approves a harmful call.
+What it does not show: how often a real model falls for such text (it assumes always); whether a model that looks for a way around the holds finds one, through a tool the rule does not hold (a hold covers only the tools it names: see below); what a tool the suite takes to only read (by its name) does in a later goose; and a user who approves a harmful call. The suite also fails when goose renders a recipe-changing value otherwise than the case expects.
 
 ## Use
 
@@ -166,7 +166,7 @@ To see runs that were held, and their calls, without a model provider, keep the 
 | `rules[].folder`, `rules[].pattern` | a folder source: new files in the folder (not its subfolders) whose name matches the pattern (`*`, `?`, `[...]`, case-sensitive; default `*`). Files already there when the rule first watches the folder are not new; files that arrive while goose-triggers is stopped are taken when it starts. Hidden files are ignored |
 | `rules[].webhook: true` | a webhook source: `POST /hooks/<rule name>` |
 | `rules[].recipe` | the goose recipe (YAML or JSON) |
-| `rules[].hold` | tool names to hold; `*` and `?` match any characters. goose's developer extension has `shell`, `write`, `edit`, `tree` and `read_image` (which loads files and `http(s)` addresses; goose adds `analyze` with it); an extension's tools are `<extension>__<tool>`, so `gmail__*` holds every tool of an extension named `gmail`. `*` holds every call |
+| `rules[].hold` | tool names to hold; `*` and `?` match any characters. goose's developer extension has `shell`, `write`, `edit`, `tree` and `read_image` (which loads files and `http(s)` addresses; goose adds `analyze` with it, and offers `load_skill`, which loads a skill's instructions); an extension's tools are `<extension>__<tool>`, so `gmail__*` holds every tool of an extension named `gmail`. `*` holds every call |
 | `rules[].working_dir` | the folder goose works in. Default `<state_dir>/work/<rule name>` |
 | `rules[].provider`, `rules[].model`, `rules[].max_turns` | passed to `goose run` as `--provider`, `--model`, `--max-turns` |
 
