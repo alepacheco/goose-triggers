@@ -189,6 +189,16 @@ pub fn wait_output(
     child: &mut std::process::Child,
     limit: std::time::Duration,
 ) -> std::io::Result<Option<std::process::Output>> {
+    wait_output_unless(child, limit, &|| false)
+}
+
+/// `wait_output`, which also kills the command and gives None as soon as `stop` says so
+/// (asked every 50 ms).
+pub fn wait_output_unless(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+    stop: &dyn Fn() -> bool,
+) -> std::io::Result<Option<std::process::Output>> {
     use std::io::Read;
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
@@ -212,7 +222,7 @@ pub fn wait_output(
         if let Some(st) = child.try_wait()? {
             break st;
         }
-        if start.elapsed() > limit {
+        if start.elapsed() > limit || stop() {
             let _ = child.kill();
             let _ = child.wait();
             return Ok(None);

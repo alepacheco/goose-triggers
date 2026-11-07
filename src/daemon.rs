@@ -171,7 +171,7 @@ pub fn queue_event(
     Ok(Some((event, run)))
 }
 
-fn check_rule(rule: &Rule, exe: &Path) -> Result<()> {
+fn check_rule(rule: &Rule, exe: &Path, goose: &str, hide_env: Option<&str>) -> Result<()> {
     std::fs::create_dir_all(&rule.working_dir).with_context(|| {
         format!(
             "rule {}: creating {}",
@@ -183,6 +183,18 @@ fn check_rule(rule: &Rule, exe: &Path) -> Result<()> {
         .with_context(|| format!("rule {}", rule.name))?;
     crate::plugin::preflight(&rule.working_dir).with_context(|| format!("rule {}", rule.name))?;
     let info = crate::recipe::read(&rule.recipe).with_context(|| format!("rule {}", rule.name))?;
+    crate::recipe::check_readable(goose, &rule.recipe, &info, &rule.working_dir, hide_env)
+        .with_context(|| format!("rule {}", rule.name))?;
+    if rule.provider.is_none()
+        && info.provider.is_none()
+        && runner::goose_default_provider().is_none()
+    {
+        // Not a refusal: goose may find a provider where goose-triggers does not look.
+        say(&format!(
+            "warning: rule {}: neither the rule (provider:) nor its recipe names a provider, and goose has none set (goose configure): goose will fail each of its runs until one is",
+            rule.name
+        ));
+    }
     if !rule.hold.is_empty() {
         // Every provider goose may run the rule's runs on. Each run checks again as it starts,
         // in case goose's config has changed.
@@ -271,7 +283,12 @@ pub fn run(cfg: Config) -> Result<()> {
         "set `goose:` in the config to the goose binary",
     )?;
     for rule in &cfg.rules {
-        check_rule(rule, &exe)?;
+        check_rule(
+            rule,
+            &exe,
+            &cfg.goose,
+            cfg.webhook.as_ref().and_then(|w| w.secret_env.as_deref()),
+        )?;
     }
     // SAFETY: the handler only stores to an atomic.
     unsafe {

@@ -65,6 +65,15 @@ pub fn status(cfg: &Config, all: bool) -> Result<()> {
                 "approved: resumes when `goose-triggers run` picks it up (`reject {}` withdraws it)",
                 r.id
             ),
+            state::REJECTED => match store
+                .calls(r.id)?
+                .into_iter()
+                .rev()
+                .find(|c| c.state == "rejected")
+            {
+                Some(c) => format!("rejected: {} {}", c.tool_name, call_line(&c.tool_input, 80)),
+                None => "rejected".into(),
+            },
             _ => String::new(),
         };
         println!(

@@ -162,6 +162,32 @@ pub fn check_values_stay_text(
     Ok(real)
 }
 
+/// At `goose-triggers run`'s start: goose reads the recipe as a recipe (a title, a
+/// description, a prompt or instructions, as goose itself requires), rendered with a
+/// placeholder for each parameter an event can fill, so a file that is no recipe is refused at
+/// start rather than at each event. A recipe with a required file parameter is left to each
+/// event, which is refused for it.
+pub fn check_readable(
+    goose: &str,
+    recipe: &Path,
+    info: &RecipeInfo,
+    wd: &Path,
+    hide_env: Option<&str>,
+) -> Result<()> {
+    if info.params.iter().any(|p| p.file && p.needed) {
+        return Ok(());
+    }
+    let placeholders: Vec<(String, String)> = info
+        .params
+        .iter()
+        .filter(|p| !p.file)
+        .map(|p| (p.key.clone(), "goosetriggersplaceholder".to_string()))
+        .collect();
+    render(goose, recipe, &placeholders, wd, hide_env)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("goose cannot read the recipe {} ({e:#})", recipe.display()))
+}
+
 /// goose's own output when it could not render a recipe, which may quote the values it was
 /// given.
 #[derive(Debug)]

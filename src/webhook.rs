@@ -53,6 +53,44 @@ pub fn fields_from_body(body: &str) -> BTreeMap<String, String> {
     fields
 }
 
+/// Where a request goes, before its body is read: `/health`'s answer, or the webhook rule it
+/// posts to, or why not. The secret is checked first for every path under `/hooks/`, so a
+/// caller without it learns nothing of the rules (which names exist, which methods they take).
+fn route<'a>(
+    cfg: &'a Config,
+    secret: &str,
+    method: &str,
+    url: &str,
+    authorization: Option<&str>,
+) -> std::result::Result<&'a crate::config::Rule, Reply> {
+    let path = url.split('?').next().unwrap_or("");
+    if (method == "GET" || method == "HEAD") && path == "/health" {
+        return Err(reply(200, json!({"ok": true})));
+    }
+    let Some(name) = path.strip_prefix("/hooks/") else {
+        return Err(reply(404, json!({"error": "not found"})));
+    };
+    let given = authorization
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !same_secret(given.as_bytes(), secret.as_bytes()) {
+        return Err(reply(
+            401,
+            json!({"error": "missing or wrong shared secret"}),
+        ));
+    }
+    let Some(rule) = cfg
+        .rule(name)
+        .filter(|r| matches!(r.source, Source::Webhook))
+    else {
+        return Err(reply(404, json!({"error": "no webhook rule by that name"})));
+    };
+    if method != "POST" {
+        return Err(reply(405, json!({"error": "use POST"})));
+    }
+    Ok(rule)
+}
+
 /// Handles one request; `queue` stores the event and its run, returning their ids.
 pub fn handle(
     cfg: &Config,
@@ -63,28 +101,10 @@ pub fn handle(
     body: &mut dyn Read,
     queue: &mut Queue,
 ) -> Reply {
-    let path = url.split('?').next().unwrap_or("");
-    if (method == "GET" || method == "HEAD") && path == "/health" {
-        return reply(200, json!({"ok": true}));
-    }
-    let Some(name) = path.strip_prefix("/hooks/") else {
-        return reply(404, json!({"error": "not found"}));
+    let rule = match route(cfg, secret, method, url, authorization) {
+        Ok(rule) => rule,
+        Err(r) => return r,
     };
-    let Some(rule) = cfg
-        .rule(name)
-        .filter(|r| matches!(r.source, Source::Webhook))
-    else {
-        return reply(404, json!({"error": "no webhook rule by that name"}));
-    };
-    if method != "POST" {
-        return reply(405, json!({"error": "use POST"}));
-    }
-    let given = authorization
-        .and_then(|a| a.strip_prefix("Bearer "))
-        .unwrap_or("");
-    if !same_secret(given.as_bytes(), secret.as_bytes()) {
-        return reply(401, json!({"error": "missing or wrong shared secret"}));
-    }
     let mut buf = Vec::new();
     if let Err(e) = body.take(MAX_BODY as u64 + 1).read_to_end(&mut buf) {
         return if matches!(
@@ -280,6 +300,14 @@ fn serve_one(cfg: &Config, secret: &str, stream: TcpStream, deadline: Duration) 
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
     };
+    // The route and the secret before anything about the body.
+    if let Err(r) = route(cfg, secret, &method, &target, header("authorization")) {
+        if r.status == 401 {
+            say_refused(cfg, &target);
+        }
+        respond(&stream, r, method == "HEAD");
+        return;
+    }
     let length = match (header("transfer-encoding"), header("content-length")) {
         (Some(_), _) => {
             respond(
@@ -305,12 +333,8 @@ fn serve_one(cfg: &Config, secret: &str, stream: TcpStream, deadline: Duration) 
             }
         },
     };
-    let authorized = header("authorization")
-        .and_then(|a| a.strip_prefix("Bearer "))
-        .is_some_and(|given| same_secret(given.as_bytes(), secret.as_bytes()));
     if length > 0
         && length <= MAX_BODY as u64
-        && authorized
         && header("expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue"))
     {
         let _ = (&stream).write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
@@ -347,12 +371,21 @@ fn serve_one(cfg: &Config, secret: &str, stream: TcpStream, deadline: Duration) 
             &mut queue,
         )
     };
-    if r.status == 401 {
-        crate::daemon::say(&format!(
-            "webhook {target}: refused, wrong or missing secret"
-        ));
-    }
     respond(&stream, r, method == "HEAD");
+}
+
+/// The daemon's line for a request refused for its secret. The path is the sender's text: it
+/// is named only when it is a webhook rule's.
+fn say_refused(cfg: &Config, target: &str) {
+    let path = target.split('?').next().unwrap_or("");
+    let rule = path
+        .strip_prefix("/hooks/")
+        .and_then(|n| cfg.rule(n))
+        .filter(|r| matches!(r.source, Source::Webhook));
+    crate::daemon::say(&match rule {
+        Some(r) => format!("webhook /hooks/{}: refused, wrong or missing secret", r.name),
+        None => "webhook: a request to a path under /hooks/ that is no webhook rule's refused, wrong or missing secret".to_string(),
+    });
 }
 
 /// Counts a request while it is served, however its thread ends.
@@ -473,8 +506,45 @@ mod tests {
         assert_eq!(call(&c, "POST", "/hooks/nope", ok, "{}"), (404, 0));
         assert_eq!(call(&c, "GET", "/hooks/form", ok, ""), (405, 0));
         assert_eq!(call(&c, "GET", "/health", None, ""), (200, 0));
+        assert_eq!(call(&c, "GET", "/nope", None, ""), (404, 0));
         let big = "x".repeat(MAX_BODY + 1);
         assert_eq!(call(&c, "POST", "/hooks/form", ok, &big), (413, 0));
+    }
+
+    #[test]
+    fn without_the_secret_no_rule_name_or_method_is_told() {
+        let c = cfg();
+        // A rule's name, a folder rule's, none, and a wrong method: all the same 401.
+        for (method, path) in [
+            ("POST", "/hooks/form"),
+            ("POST", "/hooks/files"),
+            ("POST", "/hooks/nope"),
+            ("GET", "/hooks/form"),
+            ("PUT", "/hooks/nope"),
+        ] {
+            assert_eq!(
+                call(&c, method, path, None, "{}"),
+                (401, 0),
+                "{method} {path}"
+            );
+        }
+        // Nor the body's size, nor how it is sent.
+        let big = format!(
+            "POST /hooks/form HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY + 1
+        );
+        assert!(exchange(&c, &big).starts_with("HTTP/1.1 401"));
+        let chunked = "POST /hooks/nope HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert!(exchange(&c, chunked).starts_with("HTTP/1.1 401"));
+        let ok = "Authorization: Bearer 0123456789abcdef\r\n";
+        let big = format!(
+            "POST /hooks/form HTTP/1.1\r\n{ok}Content-Length: {}\r\n\r\n",
+            MAX_BODY + 1
+        );
+        assert!(exchange(&c, &big).starts_with("HTTP/1.1 413"));
+        let chunked =
+            format!("POST /hooks/form HTTP/1.1\r\n{ok}Transfer-Encoding: chunked\r\n\r\n");
+        assert!(exchange(&c, &chunked).starts_with("HTTP/1.1 411"));
     }
 
     /// Sends raw bytes to serve_one, which gives the request `deadline` to arrive, and
@@ -510,12 +580,15 @@ mod tests {
     fn announced_bodies_are_not_waited_for_or_drained() {
         let c = cfg();
         let start = std::time::Instant::now();
-        let huge = "POST /hooks/form HTTP/1.1\r\nContent-Length: 100000000000000000\r\n\r\n";
-        assert_eq!(exchange(&c, huge), "HTTP/1.1 413 Payload Too Large");
+        let ok = "Authorization: Bearer 0123456789abcdef\r\n";
+        let huge =
+            format!("POST /hooks/form HTTP/1.1\r\n{ok}Content-Length: 100000000000000000\r\n\r\n");
+        assert_eq!(exchange(&c, &huge), "HTTP/1.1 413 Payload Too Large");
         let stalled = "POST /hooks/form HTTP/1.1\r\nContent-Length: 5000\r\n\r\n";
         assert_eq!(exchange(&c, stalled), "HTTP/1.1 401 Unauthorized");
-        let chunked = "POST /hooks/form HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
-        assert_eq!(exchange(&c, chunked), "HTTP/1.1 411 Length Required");
+        let chunked =
+            format!("POST /hooks/form HTTP/1.1\r\n{ok}Transfer-Encoding: chunked\r\n\r\n");
+        assert_eq!(exchange(&c, &chunked), "HTTP/1.1 411 Length Required");
         assert!(start.elapsed() < Duration::from_secs(3));
     }
 

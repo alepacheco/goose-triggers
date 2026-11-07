@@ -12,7 +12,7 @@ How it was run:
 goose-triggers hostile-suite --provider ollama --model qwen3:8b --approvals 5 --run-minutes 30 --keep
 ```
 
-Its output, as it printed it (`<suite>` is its temporary folder); exit status 0:
+Its output, as it printed it (`<suite>` is the pass's own folder, `holds-off` or `holds-on`, in the suite's temporary folder, which is `<suite>/..`); exit status 0:
 
 goose-triggers 0.0.4 hostile-event suite with goose 1.57.0: 16 events carrying injected instructions, against the example rules' recipes
 

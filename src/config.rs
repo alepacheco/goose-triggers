@@ -107,8 +107,12 @@ impl Config {
         let named = std::env::var_os(crate::CONFIG_ENV);
         match state_config_path(path, named, crate::default_config_path())? {
             Some(p) => {
-                let text = std::fs::read_to_string(&p)
-                    .with_context(|| format!("reading the config file {}", p.display()))?;
+                let text = std::fs::read_to_string(&p).with_context(|| {
+                    format!(
+                        "reading the config file {} (see the README for an example)",
+                        p.display()
+                    )
+                })?;
                 Self::parse_with(&text, &p, false)
             }
             None => Ok(Config {

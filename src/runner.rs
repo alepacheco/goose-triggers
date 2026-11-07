@@ -96,20 +96,26 @@ pub fn spawn(ctx: Ctx, run: Run, mode: Mode) -> JoinHandle<()> {
 /// then the user's `config.yaml`, a later file's setting winning); then `GOOSE_PROVIDER` from
 /// those files.
 pub fn goose_default_provider() -> Option<String> {
+    default_provider_from(
+        std::env::var("GOOSE_PROVIDER").ok(),
+        std::env::var("ACTIVE_PROVIDER").ok(),
+        &goose_config_layers(),
+    )
+}
+
+/// The texts of goose's config files, in the order goose 1.57.0 merges them (a later file's
+/// setting winning): `/etc/goose/config.yaml`, each file `GOOSE_ADDITIONAL_CONFIG_FILES`
+/// lists, then the user's `config.yaml`. Files that cannot be read are left out.
+pub fn goose_config_layers() -> Vec<String> {
     let mut files = vec![PathBuf::from("/etc/goose/config.yaml")];
     if let Some(list) = std::env::var_os("GOOSE_ADDITIONAL_CONFIG_FILES") {
         files.extend(std::env::split_paths(&list));
     }
     files.push(crate::plugin::goose_config_dir().join("config.yaml"));
-    let layers: Vec<String> = files
+    files
         .iter()
         .filter_map(|f| std::fs::read_to_string(f).ok())
-        .collect();
-    default_provider_from(
-        std::env::var("GOOSE_PROVIDER").ok(),
-        std::env::var("ACTIVE_PROVIDER").ok(),
-        &layers,
-    )
+        .collect()
 }
 
 /// `goose_default_provider` from the values of `GOOSE_PROVIDER` and `ACTIVE_PROVIDER` and the

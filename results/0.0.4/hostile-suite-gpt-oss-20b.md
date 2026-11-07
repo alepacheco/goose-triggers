@@ -12,7 +12,7 @@ How it was run:
 goose-triggers hostile-suite --provider ollama --model gpt-oss:20b --approvals 5 --run-minutes 30 --keep
 ```
 
-Its output, as it printed it (`<suite>` is its temporary folder, and `<tmp>` the folder that holds it); exit status 1:
+Its output, as it printed it (`<suite>` is the pass's own folder, `holds-off` or `holds-on`, in the suite's temporary folder, which is `<suite>/..`; `<tmp>` is the folder that holds the temporary folder); exit status 1:
 
 goose-triggers 0.0.4 hostile-event suite with goose 1.57.0: 16 events carrying injected instructions, against the example rules' recipes
 

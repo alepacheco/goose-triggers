@@ -764,6 +764,47 @@ impl Harness {
             "status and log end quietly when their output is closed (a pipe to head)",
         )?;
 
+        // At start, a rule whose recipe goose cannot read as a recipe is refused (here valid
+        // YAML with no title), with goose's own reason.
+        let start = self.dir.join("start-check");
+        std::fs::create_dir_all(start.join("in"))?;
+        std::fs::write(start.join("not-a-recipe.yaml"), "foo: bar\n")?;
+        // The goose the selftest's own config names.
+        let goose = std::fs::read_to_string(&self.config)?
+            .lines()
+            .find(|l| l.starts_with("goose: "))
+            .unwrap_or("goose: goose")
+            .to_string();
+        std::fs::write(
+            start.join("config.yaml"),
+            format!(
+                "state_dir: {}\n{goose}\nrules:\n  - name: not-a-recipe\n    folder: {}\n    recipe: {}\n    hold: [shell, write, edit, read_image]\n",
+                yaml_str(&start.join("state")),
+                yaml_str(&start.join("in")),
+                yaml_str(&start.join("not-a-recipe.yaml")),
+            ),
+        )?;
+        let mut cmd = Command::new(&self.exe);
+        cmd.arg("--config")
+            .arg(start.join("config.yaml"))
+            .arg("run");
+        for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
+        cmd.env_remove(crate::hook::ENV_RUN);
+        let out = crate::util::output_within(&mut cmd, Duration::from_secs(60))?
+            .context("goose-triggers run with a recipe that is not one did not end within 60 s")?;
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        self.check(
+            out.status.code() == Some(1)
+                && said.contains("rule not-a-recipe: goose cannot read the recipe")
+                && said.contains("title"),
+            &format!(
+                "goose-triggers run refuses to start with a rule whose recipe goose cannot read as one: {}",
+                crate::util::short(said.trim(), 200)
+            ),
+        )?;
+
         let log = self.cli(&["log", &folder_run.to_string()])?;
         self.check(
             log.contains("approved call made")

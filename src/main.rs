@@ -20,7 +20,7 @@ mod webhook;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
@@ -79,9 +79,9 @@ enum Cmd {
         /// The goose binary to test with [default: goose on PATH]
         #[arg(long, value_name = "PATH")]
         goose: Option<PathBuf>,
-        /// The holds of the second pass, comma-separated [default: shell,write,edit,read_image, the example rules']
-        #[arg(long, value_name = "TOOLS")]
-        holds: Option<String>,
+        /// The holds of the second pass: tool names (or patterns), separated by commas or spaces [default: shell,write,edit,read_image, the example rules']
+        #[arg(long, value_name = "TOOLS", value_parser = hostile::parse_holds)]
+        holds: Option<hostile::Holds>,
         /// Keep the suite's temporary folder even when every result is as expected
         #[arg(long)]
         keep: bool,
@@ -91,15 +91,22 @@ enum Cmd {
         /// The real model, as the provider names it (qwen3:8b, ...); needs --provider
         #[arg(long, value_name = "NAME", requires = "provider")]
         model: Option<String>,
-        /// With a real model: also send this many plain entries (at most 10) and approve the calls they are held at (at most 6 a run, the later ones rejected), to see what the model does after an approval
-        #[arg(long, value_name = "N", default_value_t = 0, requires = "provider")]
-        approvals: usize,
-        /// With a real model: how long one run may go on, in minutes; the suite stops a run that takes longer and shows it as timed out
+        /// With a real model: also send this many plain entries (0 to 10) and approve the calls they are held at (at most 6 a run, the later ones rejected), to see what the model does after an approval
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = 0,
+            requires = "provider",
+            value_parser = clap::value_parser!(u64).range(..=10)
+        )]
+        approvals: u64,
+        /// With a real model: how long one run's goose may go on, in minutes (1 to 1440); the suite stops a run that takes longer and shows it as timed out
         #[arg(
             long,
             value_name = "MINUTES",
             default_value_t = 20,
-            requires = "provider"
+            requires = "provider",
+            value_parser = clap::value_parser!(u64).range(1..=1440)
         )]
         run_minutes: u64,
     },
@@ -110,6 +117,17 @@ enum Cmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let (Some(_), Cmd::Selftest { .. } | Cmd::HostileSuite { .. }) = (&cli.config, &cli.command)
+    {
+        // Both make a config of their own in a temporary folder: a config named here would do
+        // nothing, which reads as if it did.
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "selftest and hostile-suite make a config of their own in a temporary folder: -c/--config is not for them",
+            )
+            .exit();
+    }
     if let Cmd::Hook = cli.command {
         return ExitCode::from(hook::main_hook());
     }
@@ -149,7 +167,7 @@ fn main() -> ExitCode {
                 (Some(provider), Some(model)) => hostile::Model::Real { provider, model },
                 _ => hostile::Model::Scripted,
             },
-            approvals,
+            approvals: approvals as usize,
             run_minutes,
         }),
         Cmd::Hook => unreachable!(),

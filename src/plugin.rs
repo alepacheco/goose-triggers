@@ -76,7 +76,8 @@ fn write_if_changed(path: &Path, text: &str) -> Result<()> {
     std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
 }
 
-/// The other plugins in a working folder (goose loads every folder there).
+/// The other plugins in a working folder: goose takes every folder there for a plugin; an
+/// empty one holds nothing for it to load.
 pub fn other_plugins(working_dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(working_dir.join(".agents").join("plugins")) else {
         return Vec::new();
@@ -84,6 +85,7 @@ pub fn other_plugins(working_dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = entries
         .flatten()
         .filter(|e| e.path().is_dir())
+        .filter(|e| std::fs::read_dir(e.path()).map_or(true, |mut d| d.next().is_some()))
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n != PLUGIN_NAME)
         .collect();
@@ -100,55 +102,91 @@ pub fn goose_config_dir() -> PathBuf {
     }
 }
 
-/// Refuses a working folder where goose's settings disable goose-triggers' plugin: its
-/// hooks would not run, so nothing would be held.
-pub fn preflight(working_dir: &Path) -> Result<()> {
-    let root = plugin_root(working_dir);
-    let config = goose_config_dir().join("config.yaml");
-    if let Ok(text) = std::fs::read_to_string(&config) {
-        if let Ok(v) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&text) {
-            let key = serde_yaml_ng::Value::String(root.to_string_lossy().into_owned());
-            let enabled = v
-                .get("plugins")
-                .and_then(|p| p.get(&key))
+/// A plugin settings file as goose 1.57.0 reads it (the open-plugins format): a file that does
+/// not parse as this is passed over whole.
+#[derive(serde::Deserialize)]
+struct Settings {
+    #[serde(default, rename = "enabledPlugins")]
+    enabled: Vec<String>,
+    #[serde(default, rename = "disabledPlugins")]
+    disabled: Vec<String>,
+}
+
+/// goose's plugin settings files for a working folder, in the order goose 1.57.0 reads them,
+/// the first that names a plugin deciding: the folder's `.config/goose/settings.local.json`,
+/// its `.config/goose/settings.json`, then the user's `~/.config/goose/settings.json`
+/// (`$GOOSE_PATH_ROOT/.config/goose/settings.json` when that is set).
+fn settings_files(working_dir: &Path) -> Vec<PathBuf> {
+    let user = match std::env::var_os("GOOSE_PATH_ROOT") {
+        Some(r) if Path::new(&r).is_absolute() => PathBuf::from(r),
+        _ => crate::util::home_dir(),
+    };
+    vec![
+        working_dir.join(".config/goose/settings.local.json"),
+        working_dir.join(".config/goose/settings.json"),
+        user.join(".config/goose/settings.json"),
+    ]
+}
+
+/// Whether goose's config (`config_layers`, the files' texts in goose's merge order) turns off
+/// the plugin at `root`: its `plugins:` entry for that path has `enabled: false`. The last file
+/// that has `plugins:` gives the whole map, as goose merges top-level keys.
+fn disabled_in_config(config_layers: &[String], root: &Path) -> bool {
+    let key = serde_yaml_ng::Value::String(root.to_string_lossy().into_owned());
+    config_layers
+        .iter()
+        .rev()
+        .filter_map(|t| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(t).ok())
+        .find_map(|v| v.get("plugins").cloned())
+        .and_then(|p| {
+            p.get(&key)
                 .and_then(|e| e.get("enabled"))
-                .and_then(|e| e.as_bool());
-            if enabled == Some(false) {
-                bail!(
-                    "goose's config ({}) disables the plugin at {}: set its `enabled` to true, or nothing could be held",
-                    config.display(),
-                    root.display()
-                );
-            }
+                .and_then(|e| e.as_bool())
+        })
+        == Some(false)
+}
+
+/// The settings file that turns goose-triggers' plugin off, as goose decides it: the first
+/// file (in `settings_files` order) that lists it, if it lists it under `disabledPlugins`.
+fn disabled_by(files: &[PathBuf]) -> Option<PathBuf> {
+    for f in files {
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        let Ok(s) = serde_json::from_str::<Settings>(&text) else {
+            continue;
+        };
+        if s.disabled.iter().any(|n| n == PLUGIN_NAME) {
+            return Some(f.clone());
+        }
+        if s.enabled.iter().any(|n| n == PLUGIN_NAME) {
+            return None;
         }
     }
-    let user_settings = match std::env::var_os("GOOSE_PATH_ROOT") {
-        Some(r) if Path::new(&r).is_absolute() => {
-            PathBuf::from(r).join(".config/goose/settings.json")
-        }
-        _ => crate::util::home_dir().join(".config/goose/settings.json"),
-    };
-    for settings in [
-        user_settings,
-        working_dir.join(".config/goose/settings.json"),
-        working_dir.join(".config/goose/settings.local.json"),
-    ] {
-        let Ok(text) = std::fs::read_to_string(&settings) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
-        let disabled = v
-            .get("disabledPlugins")
-            .and_then(Value::as_array)
-            .is_some_and(|a| a.iter().any(|n| n.as_str() == Some(PLUGIN_NAME)));
-        if disabled {
-            bail!(
-                "{} lists {PLUGIN_NAME} in disabledPlugins: remove it, or nothing could be held",
-                settings.display()
-            );
-        }
+    None
+}
+
+/// Refuses a working folder where goose's settings turn goose-triggers' plugin off, as goose
+/// 1.57.0 reads them: its hooks would not run, so nothing would be held. goose reads two kinds:
+/// a `plugins:` entry in its config (`~/.config/goose/config.yaml`), keyed by the plugin's
+/// folder, with `enabled: false`; and `disabledPlugins` (and `enabledPlugins`) lists in its
+/// plugin settings files.
+pub fn preflight(working_dir: &Path) -> Result<()> {
+    // goose keys its config by the folder it runs in, as the system names it.
+    let wd = std::fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
+    let root = plugin_root(&wd);
+    if disabled_in_config(&crate::runner::goose_config_layers(), &root) {
+        bail!(
+            "goose's config ({}, or a file goose merges with it) turns off the plugin at {}: set its `enabled` under `plugins:` to true, or nothing could be held",
+            goose_config_dir().join("config.yaml").display(),
+            root.display()
+        );
+    }
+    if let Some(f) = disabled_by(&settings_files(&wd)) {
+        bail!(
+            "{} lists {PLUGIN_NAME} in disabledPlugins: remove it, or nothing could be held",
+            f.display()
+        );
     }
     Ok(())
 }
@@ -184,6 +222,9 @@ mod tests {
         assert!(root.join("hooks/hooks.json").is_file());
         preflight(&dir).unwrap();
         assert!(other_plugins(&dir).is_empty());
+        // An empty folder holds no plugin.
+        std::fs::create_dir_all(dir.join(".agents/plugins/empty")).unwrap();
+        assert!(other_plugins(&dir).is_empty());
         std::fs::create_dir_all(dir.join(".agents/plugins/other/hooks")).unwrap();
         assert_eq!(other_plugins(&dir), ["other"]);
         std::fs::create_dir_all(dir.join(".config/goose")).unwrap();
@@ -193,5 +234,60 @@ mod tests {
         )
         .unwrap();
         assert!(preflight(&dir).is_err());
+    }
+
+    #[test]
+    fn the_first_settings_file_that_names_the_plugin_decides_as_in_goose() {
+        let dir = std::env::temp_dir().join(format!(
+            "gt-plugin-settings-{}-{}",
+            std::process::id(),
+            crate::util::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, text: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, text).unwrap();
+            p
+        };
+        let (local, project, user) = (dir.join("l.json"), dir.join("p.json"), dir.join("u.json"));
+        let files = [local.clone(), project.clone(), user.clone()];
+        assert_eq!(disabled_by(&files), None);
+        file("u.json", r#"{"disabledPlugins":["goose-triggers"]}"#);
+        assert_eq!(disabled_by(&files), Some(user.clone()));
+        // A file nearer the folder that enables it wins, as in goose.
+        file("p.json", r#"{"enabledPlugins":["goose-triggers"]}"#);
+        assert_eq!(disabled_by(&files), None);
+        file(
+            "l.json",
+            r#"{"disabledPlugins":["goose-triggers"],"enabledPlugins":[]}"#,
+        );
+        assert_eq!(disabled_by(&files), Some(local.clone()));
+        // goose passes over a file it cannot read as settings (a map where it wants a list).
+        file(
+            "l.json",
+            r#"{"enabledPlugins":{"goose-triggers":false},"disabledPlugins":["goose-triggers"]}"#,
+        );
+        assert_eq!(disabled_by(&files), None);
+        file("p.json", r#"{"disabledPlugins":["other"]}"#);
+        assert_eq!(disabled_by(&files), Some(user));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_last_config_file_with_plugins_decides() {
+        let root = Path::new("/w/.agents/plugins/goose-triggers");
+        let off =
+            "plugins:\n  /w/.agents/plugins/goose-triggers:\n    enabled: false\n".to_string();
+        let on = "plugins:\n  /w/.agents/plugins/goose-triggers:\n    enabled: true\n".to_string();
+        let other =
+            "plugins:\n  /x/.agents/plugins/goose-triggers:\n    enabled: false\n".to_string();
+        assert!(disabled_in_config(std::slice::from_ref(&off), root));
+        assert!(!disabled_in_config(&[off.clone(), on], root));
+        assert!(!disabled_in_config(&[off.clone(), other], root));
+        assert!(disabled_in_config(
+            &[off, "GOOSE_PROVIDER: openai\n".into()],
+            root
+        ));
+        assert!(!disabled_in_config(&[], root));
     }
 }
