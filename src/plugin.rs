@@ -280,7 +280,9 @@ mod tests {
         let root = install(&dir, Path::new("/bin/gt")).unwrap();
         assert!(root.join("plugin.json").is_file());
         assert!(root.join("hooks/hooks.json").is_file());
-        preflight(&dir).unwrap();
+        // goose's own settings given, not read from this machine's.
+        let user = dir.join("home");
+        preflight_with(&dir, None, &[], &user).unwrap();
         assert!(other_plugins(&dir).is_empty());
         // An empty folder holds no plugin.
         std::fs::create_dir_all(dir.join(".agents/plugins/empty")).unwrap();
@@ -293,7 +295,8 @@ mod tests {
             r#"{"disabledPlugins":["goose-triggers"]}"#,
         )
         .unwrap();
-        assert!(preflight(&dir).is_err());
+        assert!(preflight_with(&dir, None, &[], &user).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -5,10 +5,37 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+/// The home folder, found as goose finds it (the `dirs` crate): `$HOME` unless it is unset or
+/// empty, else the user's entry in the system's user database; `/` when neither gives one.
 pub fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+    match std::env::var_os("HOME") {
+        Some(h) if !h.is_empty() => PathBuf::from(h),
+        _ => passwd_home().unwrap_or_else(|| PathBuf::from("/")),
+    }
+}
+
+/// The home folder the user database gives this process's user.
+fn passwd_home() -> Option<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: getpwuid_r fills `pw` with pointers into `buf`, which outlives their use here.
+    unsafe {
+        let mut pw: libc::passwd = std::mem::zeroed();
+        let mut out: *mut libc::passwd = std::ptr::null_mut();
+        let rc = libc::getpwuid_r(
+            libc::getuid(),
+            &mut pw,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut out,
+        );
+        if rc != 0 || out.is_null() || pw.pw_dir.is_null() {
+            return None;
+        }
+        let dir = CStr::from_ptr(pw.pw_dir).to_bytes();
+        (!dir.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(dir)))
+    }
 }
 
 /// `$XDG_CONFIG_HOME`, else `~/.config`.
@@ -270,6 +297,15 @@ pub fn goose_version(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_user_database_gives_a_home_folder() {
+        // The fallback when HOME is unset or empty, as goose has it (a container's user may
+        // have no entry: then there is none).
+        if let Some(home) = passwd_home() {
+            assert!(home.is_absolute(), "{}", home.display());
+        }
+    }
 
     #[test]
     fn a_missing_goose_is_named_with_the_hint() {
