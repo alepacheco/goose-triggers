@@ -281,6 +281,13 @@ pub fn run(cfg: Config) -> Result<()> {
     if cfg.rules.is_empty() {
         bail!("the config has no rules");
     }
+    // goose reads its settings under the home folder unless GOOSE_PATH_ROOT moves them; with
+    // no home folder to find, goose-triggers could not check them where goose reads them.
+    let path_root =
+        std::env::var_os("GOOSE_PATH_ROOT").is_some_and(|r| Path::new(&r).is_absolute());
+    if !path_root && crate::util::home_found().is_none() {
+        bail!("no home folder: HOME is unset or empty and the user database names none for this user, so goose-triggers cannot read goose's settings where goose reads them. Set HOME");
+    }
     let _lock = lock(&cfg.state_dir)?;
     crate::util::create_private_dir(&cfg.runs_dir())?;
     let store = Store::open(&cfg.db_path())?;

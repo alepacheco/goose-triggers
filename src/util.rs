@@ -8,9 +8,24 @@ use serde_json::Value;
 /// The home folder, found as goose finds it (the `dirs` crate): `$HOME` unless it is unset or
 /// empty, else the user's entry in the system's user database; `/` when neither gives one.
 pub fn home_dir() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(h) if !h.is_empty() => PathBuf::from(h),
-        _ => passwd_home().unwrap_or_else(|| PathBuf::from("/")),
+    home_found().unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// The home folder `$HOME` or the user database gives, as goose finds it; none when neither
+/// does.
+pub fn home_found() -> Option<PathBuf> {
+    home_from(std::env::var_os("HOME"), passwd_home)
+}
+
+/// The home folder from `$HOME`'s value, unless it is unset or empty, else from the user
+/// database (`passwd`).
+fn home_from(
+    home: Option<std::ffi::OsString>,
+    passwd: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match home {
+        Some(h) if !h.is_empty() => Some(PathBuf::from(h)),
+        _ => passwd(),
     }
 }
 
@@ -297,6 +312,18 @@ pub fn goose_version(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn home_is_home_unless_unset_or_empty() {
+        let db = || Some(PathBuf::from("/home/db"));
+        assert_eq!(home_from(Some("/h".into()), db), Some(PathBuf::from("/h")));
+        assert_eq!(
+            home_from(Some("".into()), db),
+            Some(PathBuf::from("/home/db"))
+        );
+        assert_eq!(home_from(None, db), Some(PathBuf::from("/home/db")));
+        assert_eq!(home_from(None, || None), None);
+    }
 
     #[test]
     fn the_user_database_gives_a_home_folder() {
