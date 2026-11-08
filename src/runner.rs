@@ -1292,7 +1292,7 @@ mod tests {
         let dir = temp("cfg").parent().unwrap().to_path_buf();
         std::fs::write(dir.join("r.yaml"), "title: t\n").unwrap();
         let cfg = Config::parse(
-            "rules:\n  - {name: form, webhook: true, recipe: r.yaml}\nwebhook: {secret: 0123456789abcdef}\n",
+            "state_dir: state\nrules:\n  - {name: form, webhook: true, recipe: r.yaml}\nwebhook: {secret: 0123456789abcdef}\n",
             &dir.join("c.yaml"),
         )
         .unwrap();

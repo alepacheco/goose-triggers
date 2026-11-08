@@ -464,7 +464,8 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join("in")).unwrap();
         std::fs::write(dir.join("r.yaml"), "title: t\n").unwrap();
-        let text = "webhook: {secret: 0123456789abcdef}\nrules:\n  - {name: form, webhook: true, recipe: r.yaml}\n  - {name: files, folder: in, recipe: r.yaml}\n";
+        // state_dir in the test's folder: the default is the user's own state folder.
+        let text = "state_dir: state\nwebhook: {secret: 0123456789abcdef}\nrules:\n  - {name: form, webhook: true, recipe: r.yaml}\n  - {name: files, folder: in, recipe: r.yaml}\n";
         Config::parse(text, &dir.join("c.yaml")).unwrap()
     }
 

@@ -359,6 +359,9 @@ impl Harness {
             ),
         ];
         for (what, file, args) in cases {
+            if interrupted() {
+                bail!("interrupted");
+            }
             let mut cmd = Command::new(&goose);
             cmd.arg("run")
                 .args(&args)
@@ -375,8 +378,11 @@ impl Harness {
             cmd.env("GOOSE_MODE", "auto")
                 .env_remove(crate::hook::ENV_RUN)
                 .env_remove(crate::hook::ENV_DB);
-            let out = crate::util::output_within(&mut cmd, WAIT)?
-                .with_context(|| format!("goose in {what} did not end within 90 s"))?;
+            let out = crate::util::output_unless(&mut cmd, WAIT, &interrupted)?;
+            if interrupted() {
+                bail!("interrupted");
+            }
+            let out = out.with_context(|| format!("goose in {what} did not end within 90 s"))?;
             let said = format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stdout),
@@ -871,7 +877,11 @@ impl Harness {
             cmd.env(k, v);
         }
         cmd.env_remove(crate::hook::ENV_RUN);
-        let out = crate::util::output_within(&mut cmd, Duration::from_secs(60))?
+        let out = crate::util::output_unless(&mut cmd, Duration::from_secs(60), &interrupted)?;
+        if interrupted() {
+            bail!("interrupted");
+        }
+        let out = out
             .context("goose-triggers run with a recipe that is not one did not end within 60 s")?;
         let said = String::from_utf8_lossy(&out.stderr).into_owned();
         self.check(

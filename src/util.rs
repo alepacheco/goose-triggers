@@ -225,13 +225,22 @@ pub fn output_within(
     cmd: &mut std::process::Command,
     limit: std::time::Duration,
 ) -> std::io::Result<Option<std::process::Output>> {
+    output_unless(cmd, limit, &|| false)
+}
+
+/// `output_within`, which also kills the command and gives None as soon as `stop` says so.
+pub fn output_unless(
+    cmd: &mut std::process::Command,
+    limit: std::time::Duration,
+    stop: &dyn Fn() -> bool,
+) -> std::io::Result<Option<std::process::Output>> {
     use std::process::Stdio;
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    wait_output(&mut child, limit)
+    wait_output_unless(&mut child, limit, stop)
 }
 
 /// Reads a started command's piped output whole and waits for it to end, killing it if it
