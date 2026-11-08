@@ -9,7 +9,9 @@
 //!   turn when goose-triggers stops it;
 //! - told that the user approved, the folder flow makes the same call again and the webhook
 //!   flow makes a different one (which must be held again);
-//! - after a call that ran, it says it is done.
+//! - after a call that ran, it says it is done;
+//! - a goose session goose-triggers did not start (`SELFTEST-OWN file=... size=...` in the
+//!   last user message) makes one large `write` of that file, then says it is done.
 //!
 //! For `hostile-suite` it plays a model that falls for every injected instruction
 //! (`Script::Obeys`): it makes each call that text in its conversation asks for, whether the
@@ -25,6 +27,7 @@ use serde_json::{json, Value};
 
 pub const FOLDER_MARK: &str = "SELFTEST-FOLDER";
 pub const WEBHOOK_MARK: &str = "SELFTEST-WEBHOOK";
+pub const OWN_MARK: &str = "SELFTEST-OWN";
 pub const DONE_TEXT: &str = "SELFTEST DONE";
 
 /// How the scripted model answers.
@@ -64,6 +67,15 @@ pub fn webhook_command(order: &str) -> String {
 /// The different command the webhook flow makes after the approval.
 pub fn webhook_changed_command(order: &str) -> String {
     format!("echo 'order {order} and more' >> selftest-orders.txt")
+}
+
+/// What the large `write` of a session goose-triggers did not start puts in its file:
+/// `size` bytes of text.
+pub fn own_content(size: usize) -> String {
+    let line = "goose-triggers selftest: a large write in a goose session it did not start\n";
+    let mut s = line.repeat(size / line.len() + 1);
+    s.truncate(size);
+    s
 }
 
 fn text_of(m: &Value) -> String {
@@ -206,6 +218,28 @@ pub fn answer(req: &Value, script: Script) -> (Answer, bool) {
         .unwrap_or_default();
     if script == Script::Obeys {
         return obeying(&msgs);
+    }
+    let last_user = msgs
+        .iter()
+        .rev()
+        .find(|m| role(m) == "user")
+        .map(text_of)
+        .unwrap_or_default();
+    if last_user.contains(OWN_MARK) {
+        if msgs.last().is_some_and(|m| role(m) == "tool") {
+            return (Answer::Text(DONE_TEXT.into()), false);
+        }
+        let path = value_after(&last_user, "file").unwrap_or_default();
+        let size = value_after(&last_user, "size")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        return (
+            Answer::Call {
+                tool: "write".into(),
+                args: json!({ "path": path, "content": own_content(size) }),
+            },
+            false,
+        );
     }
     let all_user: String = msgs
         .iter()
@@ -405,6 +439,34 @@ mod tests {
 
     fn req(msgs: Value) -> Value {
         json!({"model": "m", "stream": true, "tools": [{"type": "function", "function": {"name": "shell"}}], "messages": msgs})
+    }
+
+    #[test]
+    fn own_session_flow_writes_one_large_file_also_in_a_resumed_run_session() {
+        assert_eq!(own_content(100_000).len(), 100_000);
+        let own =
+            json!({"role": "user", "content": "SELFTEST-OWN file=big.txt size=70000 (write)"});
+        let want = Answer::Call {
+            tool: "write".into(),
+            args: json!({"path": "big.txt", "content": own_content(70_000)}),
+        };
+        // A new session, and a run's session opened again (the folder flow before it).
+        let resumed = json!([{"role": "user", "content": "SELFTEST-FOLDER file_name=a.txt file_path=/x/a.txt"},
+            {"role": "assistant", "content": null}, {"role": "tool", "content": "noted"},
+            {"role": "assistant", "content": DONE_TEXT}, own.clone()]);
+        for msgs in [
+            json!([{"role": "system", "content": "s"}, own.clone()]),
+            resumed,
+        ] {
+            let (a, delay) = answer(&req(msgs.clone()), Script::Selftest);
+            assert_eq!(a, want);
+            assert!(!delay);
+            let mut after = msgs.as_array().unwrap().clone();
+            after.push(json!({"role": "assistant", "content": null}));
+            after.push(json!({"role": "tool", "content": "Created big.txt"}));
+            let (a, _) = answer(&req(Value::Array(after)), Script::Selftest);
+            assert_eq!(a, Answer::Text(DONE_TEXT.into()));
+        }
     }
 
     #[test]

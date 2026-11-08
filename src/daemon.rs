@@ -66,7 +66,10 @@ fn wait_for_old_goose(pid: i64, run: i64) {
 /// not check them where goose reads them (nor find a `~/` path or its default config).
 pub fn check_home() -> Result<()> {
     if crate::util::goose_path_root().is_none() && crate::util::home_found().is_none() {
-        bail!("no home folder: HOME is unset or empty, and goose-triggers finds no home folder for this user in the user database, so it cannot read goose's settings where goose reads them. Set HOME");
+        bail!(
+            "{}, so it cannot read goose's settings where goose reads them. Set HOME",
+            crate::util::NO_HOME
+        );
     }
     Ok(())
 }

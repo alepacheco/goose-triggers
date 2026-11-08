@@ -111,7 +111,9 @@ pub fn goose_config_layers() -> Vec<String> {
     if let Some(list) = std::env::var_os("GOOSE_ADDITIONAL_CONFIG_FILES") {
         files.extend(std::env::split_paths(&list));
     }
-    files.push(crate::plugin::goose_config_dir().join("config.yaml"));
+    if let Ok(dir) = crate::plugin::goose_config_dir() {
+        files.push(dir.join("config.yaml"));
+    }
     files
         .iter()
         .filter_map(|f| std::fs::read_to_string(f).ok())

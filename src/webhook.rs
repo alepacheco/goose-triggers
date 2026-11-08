@@ -383,8 +383,8 @@ fn say_refused(cfg: &Config, target: &str) {
         .and_then(|n| cfg.rule(n))
         .filter(|r| matches!(r.source, Source::Webhook));
     crate::daemon::say(&match rule {
-        Some(r) => format!("webhook /hooks/{}: refused, wrong or missing secret", r.name),
-        None => "webhook: a request to a path under /hooks/ that is no webhook rule's refused, wrong or missing secret".to_string(),
+        Some(r) => format!("webhook /hooks/{}: refused (401): wrong or missing secret", r.name),
+        None => "webhook: refused (401) a request under /hooks/ to no webhook rule's path: wrong or missing secret".to_string(),
     });
 }
 

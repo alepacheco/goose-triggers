@@ -2,7 +2,8 @@
 //! scripted model server in place of a model provider (no API key):
 //! folder event -> run -> hold -> webhook event -> run -> hold -> restart -> holds still
 //! there -> approve -> the same goose session resumes -> the approved call runs -> done;
-//! approve -> a differing call is held again -> reject -> the run ends, nothing ran;
+//! goose sessions goose-triggers did not start, in the rule's working folder -> their large
+//! calls run; approve -> a differing call is held again -> reject -> the run ends, nothing ran;
 //! an event whose value would add a command to the recipe -> refused before goose runs;
 //! a run goose fails -> failed with goose's own reason, none of the event's values in it,
 //! its goose session found by name; events refused before goose runs -> their reasons quote
@@ -330,6 +331,79 @@ impl Harness {
             .any(|l| l.what.contains(text)))
     }
 
+    /// The goose binary the selftest's config names.
+    fn goose(&self) -> Result<String> {
+        let line = std::fs::read_to_string(&self.config)?
+            .lines()
+            .find_map(|l| l.strip_prefix("goose: ").map(str::to_string))
+            .context("no goose: in the selftest's config")?;
+        Ok(serde_json::from_str(&line)?)
+    }
+
+    /// goose sessions with no `GOOSE_TRIGGERS_RUN`, in the folder rule's working folder, each
+    /// making a `write` larger than a pipe holds: it runs, and the run is left as it was.
+    fn own_sessions(&mut self, run: i64, session: &str) -> Result<()> {
+        const SIZE: usize = 100_000;
+        let goose = self.goose()?;
+        let wd = self.dir.join("work/folder");
+        let cases = [
+            (
+                "a new goose session".to_string(),
+                "selftest-own-new.txt",
+                vec!["--no-profile", "--with-builtin", "developer"],
+            ),
+            (
+                format!("run {run}'s goose session {session}, opened again"),
+                "selftest-own-resumed.txt",
+                vec!["--resume", "--session-id", session],
+            ),
+        ];
+        for (what, file, args) in cases {
+            let mut cmd = Command::new(&goose);
+            cmd.arg("run")
+                .args(&args)
+                .args(["--max-turns", "4", "--text"])
+                .arg(format!(
+                    "{} file={file} size={SIZE} (write the file)",
+                    scripted_model::OWN_MARK
+                ))
+                .current_dir(&wd)
+                .stdin(Stdio::null());
+            for (k, v) in &self.env {
+                cmd.env(k, v);
+            }
+            cmd.env("GOOSE_MODE", "auto")
+                .env_remove(crate::hook::ENV_RUN)
+                .env_remove(crate::hook::ENV_DB);
+            let out = crate::util::output_within(&mut cmd, WAIT)?
+                .with_context(|| format!("goose in {what} did not end within 90 s"))?;
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let written = std::fs::read_to_string(wd.join(file)).unwrap_or_default();
+            if !out.status.success() || written != scripted_model::own_content(SIZE) {
+                let why = said
+                    .lines()
+                    .find(|l| l.contains("blocked"))
+                    .or_else(|| said.lines().rev().find(|l| !l.trim().is_empty()))
+                    .unwrap_or("");
+                bail!(
+                    "{what}, in the folder rule's working folder with no GOOSE_TRIGGERS_RUN: its write of {SIZE} bytes did not run (goose {}): {}",
+                    out.status,
+                    crate::util::short(why.trim(), 300)
+                );
+            }
+            let r = self.store()?.run(run)?.context("run gone")?;
+            self.check(
+                r.state == state::DONE && r.session_id.as_deref() == Some(session),
+                &format!("{what}, in the folder rule's working folder, not started by goose-triggers: its write of {SIZE} bytes (more than a pipe holds) went through goose-triggers' hook and ran; run {run} left as it was"),
+            )?;
+        }
+        Ok(())
+    }
+
     fn steps(&mut self) -> Result<()> {
         self.start_daemon()?;
         self.ok("goose-triggers run started, webhook listener up");
@@ -495,6 +569,11 @@ impl Harness {
             out.contains(DONE_TEXT),
             "goose's last message in that session: the scripted model's done",
         )?;
+
+        // goose sessions goose-triggers did not start, in a rule's working folder (its plugin
+        // is there): the hook lets their calls through, one larger than a pipe holds too. A new
+        // session, and the folder run's session opened again, as the README's Use says.
+        self.own_sessions(folder_run, &folder_session)?;
 
         // A call that differs from the approved one is held again; reject ends the run.
         self.cli(&["approve", &webhook_run.to_string(), "--yes"])?;
@@ -926,10 +1005,12 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
         Err(e) => {
             // Nothing ran: the folder holds only goose's own files.
             if keep {
-                println!("its files: {}", dir.display());
-            } else {
-                let _ = std::fs::remove_dir_all(&dir);
+                return Err(anyhow!(
+                    "{e:#}\nits files, kept with --keep: {}",
+                    dir.display()
+                ));
             }
+            let _ = std::fs::remove_dir_all(&dir);
             return Err(e);
         }
     };

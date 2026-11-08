@@ -7,10 +7,14 @@ use serde_json::Value;
 
 /// The home folder, found as goose finds it (the `dirs` crate): `$HOME` unless it is unset or
 /// empty, else the user's entry in the system's user database (as far as this build can read
-/// it: the static release reads `/etc/passwd`); `/` when neither gives one.
-pub fn home_dir() -> PathBuf {
-    home_found().unwrap_or_else(|| PathBuf::from("/"))
+/// it: the static release reads `/etc/passwd`); an error when neither gives one, for a path
+/// under it goose-triggers needs (its default config file or state folder, a `~/` path).
+pub fn home_dir() -> anyhow::Result<PathBuf> {
+    home_found().ok_or_else(|| anyhow::anyhow!("{NO_HOME}. Set HOME"))
 }
+
+/// Why no home folder is found.
+pub const NO_HOME: &str = "no home folder: HOME is unset or empty, and goose-triggers finds no home folder for this user in the user database";
 
 /// The home folder `$HOME` or the user database gives, as goose finds it; none when neither
 /// does.
@@ -63,35 +67,31 @@ pub fn goose_path_root() -> Option<PathBuf> {
 }
 
 /// `$XDG_CONFIG_HOME`, else `~/.config`.
-pub fn config_home() -> PathBuf {
+pub fn config_home() -> anyhow::Result<PathBuf> {
     match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(p) if !p.is_empty() && Path::new(&p).is_absolute() => PathBuf::from(p),
-        _ => home_dir().join(".config"),
+        Some(p) if !p.is_empty() && Path::new(&p).is_absolute() => Ok(PathBuf::from(p)),
+        _ => Ok(home_dir()?.join(".config")),
     }
 }
 
 /// `$XDG_DATA_HOME`, else `~/.local/share`.
-pub fn data_home() -> PathBuf {
+pub fn data_home() -> anyhow::Result<PathBuf> {
     match std::env::var_os("XDG_DATA_HOME") {
-        Some(p) if !p.is_empty() && Path::new(&p).is_absolute() => PathBuf::from(p),
-        _ => home_dir().join(".local").join("share"),
+        Some(p) if !p.is_empty() && Path::new(&p).is_absolute() => Ok(PathBuf::from(p)),
+        _ => Ok(home_dir()?.join(".local").join("share")),
     }
 }
 
 /// Expands a leading `~/` and makes a relative path relative to `base`.
-pub fn resolve_path(raw: &str, base: &Path) -> PathBuf {
+pub fn resolve_path(raw: &str, base: &Path) -> anyhow::Result<PathBuf> {
     let p = if raw == "~" {
-        home_dir()
+        home_dir()?
     } else if let Some(rest) = raw.strip_prefix("~/") {
-        home_dir().join(rest)
+        home_dir()?.join(rest)
     } else {
         PathBuf::from(raw)
     };
-    if p.is_absolute() {
-        p
-    } else {
-        base.join(p)
-    }
+    Ok(if p.is_absolute() { p } else { base.join(p) })
 }
 
 /// Creates a folder (and its missing parents) readable by this user only; one that exists is
@@ -438,11 +438,14 @@ mod tests {
     #[test]
     fn resolve_path_expands_home_and_relative() {
         let base = Path::new("/etc/gt");
-        assert_eq!(resolve_path("/x/y", base), PathBuf::from("/x/y"));
+        assert_eq!(resolve_path("/x/y", base).unwrap(), PathBuf::from("/x/y"));
         assert_eq!(
-            resolve_path("r/y.yaml", base),
+            resolve_path("r/y.yaml", base).unwrap(),
             PathBuf::from("/etc/gt/r/y.yaml")
         );
-        assert_eq!(resolve_path("~/in", base), home_dir().join("in"));
+        assert_eq!(
+            resolve_path("~/in", base).unwrap(),
+            home_dir().unwrap().join("in")
+        );
     }
 }

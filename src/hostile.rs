@@ -2130,12 +2130,14 @@ pub fn run(opts: Options) -> Result<()> {
             crate::selftest::finish_interrupted(&dir, opts.keep)
         }
         Err(e) => {
-            // Nothing was sent: the folder holds only goose's own files.
+            // Nothing was sent: the folder holds only goose's own files (its logs of the check).
             if opts.keep {
-                println!("its files: {}", dir.display());
-            } else {
-                let _ = std::fs::remove_dir_all(&dir);
+                return Err(anyhow!(
+                    "{e:#}\nits files, kept with --keep (goose's own logs of the check): {}",
+                    dir.display()
+                ));
             }
+            let _ = std::fs::remove_dir_all(&dir);
             return Err(e);
         }
     };

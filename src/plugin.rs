@@ -3,7 +3,8 @@
 //! goose loads plugins from `<working folder>/.agents/plugins/<name>/` when a session starts
 //! in that folder. goose-triggers writes its plugin into each rule's working folder, so the
 //! hooks apply where goose-triggers runs goose. Its command does nothing in sessions that
-//! goose-triggers did not start (no `GOOSE_TRIGGERS_RUN` in the environment).
+//! goose-triggers did not start (no `GOOSE_TRIGGERS_RUN` in the environment) but read what
+//! goose writes to it.
 
 use std::path::{Path, PathBuf};
 
@@ -22,9 +23,12 @@ pub fn plugin_root(working_dir: &Path) -> PathBuf {
 }
 
 /// The hook command: the goose-triggers binary at `exe`, only inside goose-triggers' runs.
+/// Elsewhere it reads the payload goose writes to it and allows the call: goose counts a
+/// payload it could not write (the hook gone before reading it, always so for one larger
+/// than a pipe holds) as a failed hook, which `on_failure: block` turns into a denied call.
 pub fn hook_command(exe: &Path) -> String {
     format!(
-        "[ -n \"${}\" ] || exit 0; exec {} hook",
+        "[ -n \"${}\" ] || {{ cat >/dev/null; exit 0; }}; exec {} hook",
         crate::hook::ENV_RUN,
         sh_quote(&exe.to_string_lossy())
     )
@@ -95,10 +99,10 @@ pub fn other_plugins(working_dir: &Path) -> Vec<String> {
 
 /// goose's config folder: `$GOOSE_PATH_ROOT/config` when that is set, else
 /// `$XDG_CONFIG_HOME/goose` or `~/.config/goose`.
-pub fn goose_config_dir() -> PathBuf {
+pub fn goose_config_dir() -> Result<PathBuf> {
     match crate::util::goose_path_root() {
-        Some(root) => root.join("config"),
-        None => crate::util::config_home().join("goose"),
+        Some(root) => Ok(root.join("config")),
+        None => Ok(crate::util::config_home()?.join("goose")),
     }
 }
 
@@ -204,7 +208,10 @@ fn disabled_by(files: &[PathBuf]) -> Option<PathBuf> {
 /// by the plugin's folder, with `enabled: false`; and `disabledPlugins` (and `enabledPlugins`)
 /// lists in its plugin settings files.
 pub fn preflight(working_dir: &Path) -> Result<()> {
-    let user = crate::util::goose_path_root().unwrap_or_else(crate::util::home_dir);
+    let user = match crate::util::goose_path_root() {
+        Some(root) => root,
+        None => crate::util::home_dir()?,
+    };
     preflight_with(
         working_dir,
         std::env::var("PLUGINS").ok().as_deref(),
@@ -233,7 +240,9 @@ fn preflight_with(
             } else {
                 format!(
                     "`plugins:` in {}, or a file goose merges with it",
-                    goose_config_dir().join("config.yaml").display()
+                    goose_config_dir()
+                        .map(|d| d.join("config.yaml").display().to_string())
+                        .unwrap_or_else(|_| "goose's config.yaml".into())
                 )
             },
             root.display()
@@ -257,7 +266,7 @@ mod tests {
         let cmd = hook_command(Path::new("/opt/it's here/goose-triggers"));
         assert_eq!(
             cmd,
-            r#"[ -n "$GOOSE_TRIGGERS_RUN" ] || exit 0; exec '/opt/it'\''s here/goose-triggers' hook"#
+            r#"[ -n "$GOOSE_TRIGGERS_RUN" ] || { cat >/dev/null; exit 0; }; exec '/opt/it'\''s here/goose-triggers' hook"#
         );
         let v = hooks_json(Path::new("/x"));
         assert_eq!(
@@ -265,6 +274,88 @@ mod tests {
             "block"
         );
         assert!(v["hooks"]["PreToolUse"][0].get("matcher").is_none());
+    }
+
+    /// Runs a hook command as goose 1.57.0 does (`sh -c`, the payload written to its stdin,
+    /// which is then closed): whether the whole payload was taken, its exit code and stdout.
+    fn run_as_goose(cmd: &str, run: Option<&str>, payload: &[u8]) -> (bool, Option<i32>, String) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut c = Command::new("sh");
+        c.arg("-c")
+            .arg(cmd)
+            .env("PLUGIN_ROOT", "/nonexistent")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        match run {
+            Some(r) => c.env(crate::hook::ENV_RUN, r),
+            None => c.env_remove(crate::hook::ENV_RUN),
+        };
+        let mut child = c.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let payload = payload.to_vec();
+        let writer = std::thread::spawn(move || stdin.write_all(&payload).is_ok());
+        let delivered = writer.join().unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            delivered,
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    }
+
+    #[test]
+    fn hook_command_outside_runs_takes_the_whole_payload_and_allows() {
+        // A call larger than a pipe holds (a write of a big file): goose must be able to write
+        // all of it, or it counts the hook as failed and blocks the call. The binary is not
+        // needed outside goose-triggers' runs.
+        let cmd = hook_command(Path::new("/nonexistent/goose-triggers"));
+        let big = format!(
+            "{{\"event\":\"PreToolUse\",\"tool_name\":\"write\",\"tool_input\":{{\"content\":\"{}\"}}}}",
+            "x".repeat(1 << 20)
+        );
+        for payload in [
+            big.as_bytes(),
+            b"{\"event\":\"PreToolUse\"}".as_slice(),
+            b"",
+        ] {
+            for _ in 0..5 {
+                let (delivered, code, stdout) = run_as_goose(&cmd, None, payload);
+                assert!(delivered, "payload of {} bytes not taken", payload.len());
+                assert_eq!(code, Some(0));
+                assert_eq!(stdout, "");
+            }
+        }
+        // Set but empty is not a run either.
+        assert_eq!(
+            run_as_goose(&cmd, Some(""), big.as_bytes()),
+            (true, Some(0), String::new())
+        );
+    }
+
+    #[test]
+    fn hook_command_in_a_run_hands_the_payload_to_the_binary() {
+        let dir = std::env::temp_dir().join(format!(
+            "gt-hookcmd-{}-{}",
+            std::process::id(),
+            crate::util::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("fake goose-triggers");
+        std::fs::write(
+            &exe,
+            "#!/bin/sh\nprintf '%s %s ' \"$1\" \"$GOOSE_TRIGGERS_RUN\"; wc -c | tr -d ' '\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let payload = vec![b'y'; 200_000];
+        let (delivered, code, stdout) = run_as_goose(&hook_command(&exe), Some("7"), &payload);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(delivered);
+        assert_eq!(code, Some(0));
+        assert_eq!(stdout.trim(), "hook 7 200000");
     }
 
     #[test]

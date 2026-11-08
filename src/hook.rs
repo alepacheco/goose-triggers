@@ -31,9 +31,14 @@ pub enum Verdict {
 }
 
 pub fn main_hook() -> u8 {
-    let Some(run) = std::env::var_os(ENV_RUN) else {
+    // The payload is read whole first: goose counts one it could not write as a failed hook,
+    // which blocks the call.
+    let mut input = Vec::new();
+    let read = std::io::stdin().read_to_end(&mut input);
+    let run = match std::env::var_os(ENV_RUN) {
+        Some(run) if !run.is_empty() => run,
         // Not a goose-triggers run (the plugin's command checks this too).
-        return 0;
+        _ => return 0,
     };
     let result = (|| -> Result<Verdict> {
         let run: i64 = run
@@ -41,10 +46,9 @@ pub fn main_hook() -> u8 {
             .and_then(|s| s.parse().ok())
             .context("GOOSE_TRIGGERS_RUN is not a run number")?;
         let db = PathBuf::from(std::env::var_os(ENV_DB).context("GOOSE_TRIGGERS_DB is not set")?);
-        let mut input = String::new();
-        std::io::stdin().read_to_string(&mut input)?;
+        read.context("reading the hook payload")?;
         let payload: Value =
-            serde_json::from_str(&input).context("the hook payload is not JSON")?;
+            serde_json::from_slice(&input).context("the hook payload is not JSON")?;
         let store = Store::open(&db)?;
         decide(&store, run, &payload)
     })();

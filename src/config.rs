@@ -88,7 +88,10 @@ impl Config {
         let named = std::env::var_os(crate::CONFIG_ENV);
         let path = match path {
             Some(p) => p.to_path_buf(),
-            None => named_config(named)?.unwrap_or_else(crate::default_config_path),
+            None => match named_config(named)? {
+                Some(p) => p,
+                None => crate::default_config_path()?,
+            },
         };
         let text = std::fs::read_to_string(&path).with_context(|| {
             format!(
@@ -105,7 +108,7 @@ impl Config {
     /// defaults serve when the default file does not exist.
     pub fn load_for_state(path: Option<&Path>) -> Result<Config> {
         let named = std::env::var_os(crate::CONFIG_ENV);
-        match state_config_path(path, named, crate::default_config_path())? {
+        match state_config_path(path, named, crate::default_config_path)? {
             Some(p) => {
                 let text = std::fs::read_to_string(&p).with_context(|| {
                     format!(
@@ -116,7 +119,7 @@ impl Config {
                 Self::parse_with(&text, &p, false)
             }
             None => Ok(Config {
-                state_dir: default_state_dir(),
+                state_dir: default_state_dir()?,
                 goose: "goose".into(),
                 max_concurrent_runs: 2,
                 webhook: None,
@@ -150,13 +153,15 @@ impl Config {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| PathBuf::from("."));
         let base = std::fs::canonicalize(&base).unwrap_or(base);
-        let state_dir = raw
-            .state_dir
-            .as_deref()
-            .map(|s| resolve_path(s, &base))
-            .unwrap_or_else(default_state_dir);
+        let state_dir = match raw.state_dir.as_deref() {
+            Some(s) => resolve_path(s, &base).context("state_dir")?,
+            None => default_state_dir()?,
+        };
         let goose = match raw.goose {
-            Some(g) if g.contains('/') => resolve_path(&g, &base).to_string_lossy().into_owned(),
+            Some(g) if g.contains('/') => resolve_path(&g, &base)
+                .context("goose")?
+                .to_string_lossy()
+                .into_owned(),
             Some(g) => g,
             None => "goose".into(),
         };
@@ -250,7 +255,7 @@ fn named_config(named: Option<std::ffi::OsString>) -> Result<Option<PathBuf>> {
 fn state_config_path(
     given: Option<&Path>,
     named: Option<std::ffi::OsString>,
-    default: PathBuf,
+    default: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<Option<PathBuf>> {
     if let Some(p) = given {
         return Ok(Some(p.to_path_buf()));
@@ -262,13 +267,15 @@ fn state_config_path(
             p.display()
         ),
         Some(p) => Ok(Some(p)),
-        None if default.exists() => Ok(Some(default)),
-        None => Ok(None),
+        None => {
+            let default = default()?;
+            Ok(default.exists().then_some(default))
+        }
     }
 }
 
-pub fn default_state_dir() -> PathBuf {
-    crate::util::data_home().join("goose-triggers")
+pub fn default_state_dir() -> Result<PathBuf> {
+    Ok(crate::util::data_home()?.join("goose-triggers"))
 }
 
 fn valid_name(name: &str) -> bool {
@@ -292,13 +299,17 @@ fn check_rule(r: RawRule, base: &Path, state_dir: &Path, strict: bool) -> Result
             bail!("rule {name}: give an event source, `folder: <path>` or `webhook: true`")
         }
         (Some(folder), false) => {
-            let path = resolve_path(&folder, base);
+            let path =
+                resolve_path(&folder, base).with_context(|| format!("rule {name}: folder"))?;
             if strict && !path.is_dir() {
                 bail!("rule {name}: folder {} does not exist", path.display());
             }
             let pattern = r.pattern.unwrap_or_else(|| "*".into());
             glob::Pattern::new(&pattern)
                 .with_context(|| format!("rule {name}: pattern {pattern:?}"))?;
+            if pattern.contains('/') {
+                bail!("rule {name}: pattern {pattern:?} has a '/', but it is matched against the names of files directly in the folder, so it would never match: make the subfolder the rule's folder instead");
+            }
             Source::Folder { path, pattern }
         }
         (None, true) => {
@@ -308,7 +319,7 @@ fn check_rule(r: RawRule, base: &Path, state_dir: &Path, strict: bool) -> Result
             Source::Webhook
         }
     };
-    let recipe = resolve_path(&r.recipe, base);
+    let recipe = resolve_path(&r.recipe, base).with_context(|| format!("rule {name}: recipe"))?;
     if strict && !recipe.is_file() {
         bail!("rule {name}: recipe {} does not exist", recipe.display());
     }
@@ -318,11 +329,10 @@ fn check_rule(r: RawRule, base: &Path, state_dir: &Path, strict: bool) -> Result
         }
         glob::Pattern::new(h).with_context(|| format!("rule {name}: hold pattern {h:?}"))?;
     }
-    let working_dir = r
-        .working_dir
-        .as_deref()
-        .map(|w| resolve_path(w, base))
-        .unwrap_or_else(|| state_dir.join("work").join(&name));
+    let working_dir = match r.working_dir.as_deref() {
+        Some(w) => resolve_path(w, base).with_context(|| format!("rule {name}: working_dir"))?,
+        None => state_dir.join("work").join(&name),
+    };
     Ok(Rule {
         name,
         source,
@@ -384,32 +394,44 @@ rules:
         let missing = dir.join("config.yml");
         let default = dir.join("default.yaml");
         // GOOSE_TRIGGERS_CONFIG naming a missing file: an error, not the default state folder.
-        let err = state_config_path(None, Some(missing.clone().into()), default.clone())
+        let err = state_config_path(None, Some(missing.clone().into()), || Ok(default.clone()))
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a file"), "{err}");
-        let err = state_config_path(None, Some("".into()), default.clone())
+        let err = state_config_path(None, Some("".into()), || Ok(default.clone()))
             .unwrap_err()
             .to_string();
         assert!(err.contains("set but empty"), "{err}");
         // -c wins; with neither, the default file only when it exists.
         assert_eq!(
-            state_config_path(Some(&missing), Some("x".into()), default.clone()).unwrap(),
+            state_config_path(Some(&missing), Some("x".into()), || Ok(default.clone())).unwrap(),
             Some(missing.clone())
         );
         assert_eq!(
-            state_config_path(None, None, default.clone()).unwrap(),
+            state_config_path(None, None, || Ok(default.clone())).unwrap(),
             None
         );
         std::fs::write(&default, "state_dir: s\n").unwrap();
         assert_eq!(
-            state_config_path(None, None, default.clone()).unwrap(),
+            state_config_path(None, None, || Ok(default.clone())).unwrap(),
             Some(default.clone())
         );
         assert_eq!(
-            state_config_path(None, Some(default.clone().into()), dir.join("other")).unwrap(),
+            state_config_path(None, Some(default.clone().into()), || Ok(dir.join("other")))
+                .unwrap(),
             Some(default)
         );
+        // With no home folder: a named file serves; the default one, under the home folder, is
+        // an error to look for, not a file under `/`.
+        let no_home = || -> Result<PathBuf> { bail!("{}", crate::util::NO_HOME) };
+        assert_eq!(
+            state_config_path(Some(&missing), None, no_home).unwrap(),
+            Some(missing.clone())
+        );
+        let err = state_config_path(None, None, no_home)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no home folder"), "{err}");
         // An empty file, or one of comments only, is refused by every command.
         for text in ["", "\n", "# nothing yet\n"] {
             let err = format!(
@@ -436,6 +458,11 @@ rules:
                 "16 characters",
             ),
             ("rules:\n  - {name: a, folder: inbox, recipe: r.yaml, colour: red}\n", "unknown field"),
+            ("rules:\n  - {name: a, folder: inbox, pattern: '[abc', recipe: r.yaml}\n", "pattern"),
+            (
+                "rules:\n  - {name: a, folder: inbox, pattern: 'sub/*.pdf', recipe: r.yaml}\n",
+                "would never match",
+            ),
             (
                 "rules:\n  - {name: a, folder: inbox, recipe: r.yaml}\n  - {name: a, folder: inbox, recipe: r.yaml}\n",
                 "two rules",
