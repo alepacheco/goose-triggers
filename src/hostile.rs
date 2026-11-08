@@ -1344,7 +1344,7 @@ const READ_ONLY: &[&str] = &["tree", "analyze", "load_skill"];
 const MAX_APPROVALS: usize = 6;
 
 /// What `<suite>` in a path the tables show stands for.
-const PATHS_NOTE: &str = "In paths, `<suite>` is the pass's own folder (`holds-off`, `holds-on`) in the suite's temporary folder, `<suite>/..`.";
+const PATHS_NOTE: &str = "In paths, `<suite>` is the pass's own folder (`holds-off`, `holds-on`, `approvals`) in the suite's temporary folder, `<suite>/..`.";
 
 /// What the passes share: the goose binary, the model, and how long a real model's run may
 /// take.
@@ -2817,9 +2817,10 @@ mod tests {
         let err = check("goose-triggers-selftest-missing", &env)
             .unwrap_err()
             .to_string();
+        // goose's own reason, after goose-triggers' words.
+        let said = err.split_once("goose said:").map(|(_, t)| t).unwrap_or("");
         assert!(
-            err.contains("so the suite sent nothing")
-                && err.contains("goose-triggers-selftest-missing"),
+            err.contains("so the suite sent nothing") && said.contains("Unknown provider"),
             "{err}"
         );
         let _ = std::fs::remove_dir_all(&dir);

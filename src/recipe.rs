@@ -163,8 +163,8 @@ pub fn check_values_stay_text(
 }
 
 /// At `goose-triggers run`'s start: the recipe declares no file parameter (goose-triggers never
-/// fills one, and goose 1.57.0 accepts a file parameter only as required, so no event could run
-/// it), and goose reads it as a recipe (a title, a description, a prompt or instructions, as
+/// fills one, and goose 1.57.0 accepts a file parameter only with no default, so no event could
+/// run it), and goose reads it as a recipe (a title, a description, a prompt or instructions, as
 /// goose itself requires), rendered with a placeholder for each parameter every event must
 /// fill and the defaults for the rest, as an event that gives only those would render it. So a
 /// file that is no recipe is refused at start rather than at each event.

@@ -114,13 +114,9 @@ struct Settings {
 
 /// goose's plugin settings files for a working folder, in the order goose 1.57.0 reads them,
 /// the first that names a plugin deciding: the folder's `.config/goose/settings.local.json`,
-/// its `.config/goose/settings.json`, then the user's `~/.config/goose/settings.json`
-/// (`$GOOSE_PATH_ROOT/.config/goose/settings.json` when that is set).
-fn settings_files(working_dir: &Path) -> Vec<PathBuf> {
-    let user = match std::env::var_os("GOOSE_PATH_ROOT") {
-        Some(r) if Path::new(&r).is_absolute() => PathBuf::from(r),
-        _ => crate::util::home_dir(),
-    };
+/// its `.config/goose/settings.json`, then the user's, `<user>/.config/goose/settings.json`
+/// (`user` is `$GOOSE_PATH_ROOT` when that is set, else the home folder).
+fn settings_files(working_dir: &Path, user: &Path) -> Vec<PathBuf> {
     vec![
         working_dir.join(".config/goose/settings.local.json"),
         working_dir.join(".config/goose/settings.json"),
@@ -208,15 +204,34 @@ fn disabled_by(files: &[PathBuf]) -> Option<PathBuf> {
 /// by the plugin's folder, with `enabled: false`; and `disabledPlugins` (and `enabledPlugins`)
 /// lists in its plugin settings files.
 pub fn preflight(working_dir: &Path) -> Result<()> {
+    let user = match std::env::var_os("GOOSE_PATH_ROOT") {
+        Some(r) if Path::new(&r).is_absolute() => PathBuf::from(r),
+        _ => crate::util::home_dir(),
+    };
+    preflight_with(
+        working_dir,
+        std::env::var("PLUGINS").ok().as_deref(),
+        &crate::runner::goose_config_layers(),
+        &user,
+    )
+}
+
+/// `preflight` with goose's `PLUGINS` variable (`plugins_env`), its config files' texts
+/// (`config_layers`) and the folder that holds the user's `.config/goose/settings.json`
+/// (`user`) given.
+fn preflight_with(
+    working_dir: &Path,
+    plugins_env: Option<&str>,
+    config_layers: &[String],
+    user: &Path,
+) -> Result<()> {
     // goose keys its config by the folder it runs in, as the system names it.
     let wd = std::fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
     let root = plugin_root(&wd);
-    let env = std::env::var("PLUGINS").ok();
-    let setting = plugins_setting(env.as_deref(), &crate::runner::goose_config_layers());
-    if disabled_in_config(setting, &root) {
+    if disabled_in_config(plugins_setting(plugins_env, config_layers), &root) {
         bail!(
             "goose's plugins setting ({}) turns off the plugin at {}: set its `enabled` to true, or nothing could be held",
-            if env.is_some() {
+            if plugins_env.is_some() {
                 "the PLUGINS variable".to_string()
             } else {
                 format!(
@@ -227,7 +242,7 @@ pub fn preflight(working_dir: &Path) -> Result<()> {
             root.display()
         );
     }
-    if let Some(f) = disabled_by(&settings_files(&wd)) {
+    if let Some(f) = disabled_by(&settings_files(&wd, user)) {
         bail!(
             "{} lists {PLUGIN_NAME} in disabledPlugins: remove it, or nothing could be held",
             f.display()
@@ -353,5 +368,36 @@ mod tests {
             plugins_setting(Some("x"), &[off]),
             root
         ));
+    }
+
+    #[test]
+    fn a_working_folder_reached_through_a_link_is_keyed_by_its_real_path() {
+        let base = std::env::temp_dir().join(format!(
+            "gt-plugin-link-{}-{}",
+            std::process::id(),
+            crate::util::now()
+        ));
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let real = std::fs::canonicalize(&real).unwrap();
+        let key = plugin_root(&real);
+        let off = format!("plugins:\n  {}:\n    enabled: false\n", key.display());
+        let user = base.join("home");
+        let err = preflight_with(&link, None, std::slice::from_ref(&off), &user).unwrap_err();
+        assert!(err.to_string().contains("turns off the plugin"), "{err}");
+        // The same through the PLUGINS variable, and a settings file in the folder.
+        let env = format!(r#"{{"{}": {{"enabled": false}}}}"#, key.display());
+        assert!(preflight_with(&link, Some(&env), &[], &user).is_err());
+        assert!(preflight_with(&link, None, &[], &user).is_ok());
+        std::fs::create_dir_all(real.join(".config/goose")).unwrap();
+        std::fs::write(
+            real.join(".config/goose/settings.json"),
+            r#"{"disabledPlugins":["goose-triggers"]}"#,
+        )
+        .unwrap();
+        assert!(preflight_with(&link, None, &[], &user).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

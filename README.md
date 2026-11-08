@@ -71,7 +71,7 @@ The selftest runs the whole path with your goose binary and a scripted model ser
 11. `approve` on a terminal asks first, and answered `n` approves nothing: the run stays held, exit status 1 (skipped, and said so, where no pseudo-terminal can be opened); `approve` with no terminal to ask on needs `--yes`, and approves even when its output is closed; `status` and `log` end quietly when their reader goes away (`| head`);
 12. `goose-triggers run` refuses to start with a rule whose recipe goose cannot read as a recipe (valid YAML with no title), with goose's reason.
 
-Pass `--goose <path>` to test another goose binary, `--keep` to keep the temporary folder. A selftest that fails keeps its folder and says where (its `daemon.log` and `state/runs/` show what happened). Stopped with Ctrl-C, it stops what it started and removes its folder (exit status 130), or keeps it with `--keep`. The selftest and the hostile-event suite make a config of their own in their folder: they do not read `GOOSE_TRIGGERS_CONFIG`, and `-c` is refused for them.
+Pass `--goose <path>` to test another goose binary, `--keep` to keep the temporary folder. A selftest that fails keeps its folder and says where (its `daemon.log` and `state/runs/` show what happened); one that cannot start, as goose does not run, removes it unless `--keep` is given. Stopped with Ctrl-C, it stops what it started and removes its folder (exit status 130), or keeps it with `--keep`. The selftest and the hostile-event suite make a config of their own in their folder: they do not read `GOOSE_TRIGGERS_CONFIG`, and `-c` is refused for them.
 
 ## Hostile events: what holds do with injected calls
 
