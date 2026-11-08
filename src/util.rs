@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 /// The home folder, found as goose finds it (the `dirs` crate): `$HOME` unless it is unset or
-/// empty, else the user's entry in the system's user database; `/` when neither gives one.
+/// empty, else the user's entry in the system's user database (as far as this build can read
+/// it: the static release reads `/etc/passwd`); `/` when neither gives one.
 pub fn home_dir() -> PathBuf {
     home_found().unwrap_or_else(|| PathBuf::from("/"))
 }
@@ -51,6 +52,14 @@ fn passwd_home() -> Option<PathBuf> {
         let dir = CStr::from_ptr(pw.pw_dir).to_bytes();
         (!dir.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(dir)))
     }
+}
+
+/// `$GOOSE_PATH_ROOT` when it is an absolute path: goose then keeps its config, data and
+/// settings under it, not under the home folder.
+pub fn goose_path_root() -> Option<PathBuf> {
+    std::env::var_os("GOOSE_PATH_ROOT")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
 }
 
 /// `$XDG_CONFIG_HOME`, else `~/.config`.

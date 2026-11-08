@@ -96,9 +96,9 @@ pub fn other_plugins(working_dir: &Path) -> Vec<String> {
 /// goose's config folder: `$GOOSE_PATH_ROOT/config` when that is set, else
 /// `$XDG_CONFIG_HOME/goose` or `~/.config/goose`.
 pub fn goose_config_dir() -> PathBuf {
-    match std::env::var_os("GOOSE_PATH_ROOT") {
-        Some(root) if Path::new(&root).is_absolute() => PathBuf::from(root).join("config"),
-        _ => crate::util::config_home().join("goose"),
+    match crate::util::goose_path_root() {
+        Some(root) => root.join("config"),
+        None => crate::util::config_home().join("goose"),
     }
 }
 
@@ -204,10 +204,7 @@ fn disabled_by(files: &[PathBuf]) -> Option<PathBuf> {
 /// by the plugin's folder, with `enabled: false`; and `disabledPlugins` (and `enabledPlugins`)
 /// lists in its plugin settings files.
 pub fn preflight(working_dir: &Path) -> Result<()> {
-    let user = match std::env::var_os("GOOSE_PATH_ROOT") {
-        Some(r) if Path::new(&r).is_absolute() => PathBuf::from(r),
-        _ => crate::util::home_dir(),
-    };
+    let user = crate::util::goose_path_root().unwrap_or_else(crate::util::home_dir);
     preflight_with(
         working_dir,
         std::env::var("PLUGINS").ok().as_deref(),

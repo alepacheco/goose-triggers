@@ -138,7 +138,9 @@ fn main() -> ExitCode {
         }
     }
     let result = match cli.command {
-        Cmd::Run => config::Config::load(cli.config.as_deref()).and_then(daemon::run),
+        Cmd::Run => daemon::check_home()
+            .and_then(|()| config::Config::load(cli.config.as_deref()))
+            .and_then(daemon::run),
         Cmd::Status { all } => config::Config::load_for_state(cli.config.as_deref())
             .and_then(|c| commands::status(&c, all)),
         Cmd::Log { run } => config::Config::load_for_state(cli.config.as_deref())

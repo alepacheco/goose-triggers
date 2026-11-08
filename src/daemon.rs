@@ -61,6 +61,16 @@ fn wait_for_old_goose(pid: i64, run: i64) {
     }
 }
 
+/// Before `goose-triggers run` reads its config: goose reads its settings under the home folder
+/// unless `GOOSE_PATH_ROOT` moves them, so with no home folder to find, goose-triggers could
+/// not check them where goose reads them (nor find a `~/` path or its default config).
+pub fn check_home() -> Result<()> {
+    if crate::util::goose_path_root().is_none() && crate::util::home_found().is_none() {
+        bail!("no home folder: HOME is unset or empty, and goose-triggers finds no home folder for this user in the user database, so it cannot read goose's settings where goose reads them. Set HOME");
+    }
+    Ok(())
+}
+
 /// Holds the state folder's lock while `goose-triggers run` runs: one daemon per state folder.
 pub fn lock(state_dir: &Path) -> Result<File> {
     crate::util::create_private_dir(state_dir)
@@ -280,13 +290,6 @@ fn schedule(store: &Store, ctx: &Ctx, active: &mut Active) -> Result<()> {
 pub fn run(cfg: Config) -> Result<()> {
     if cfg.rules.is_empty() {
         bail!("the config has no rules");
-    }
-    // goose reads its settings under the home folder unless GOOSE_PATH_ROOT moves them; with
-    // no home folder to find, goose-triggers could not check them where goose reads them.
-    let path_root =
-        std::env::var_os("GOOSE_PATH_ROOT").is_some_and(|r| Path::new(&r).is_absolute());
-    if !path_root && crate::util::home_found().is_none() {
-        bail!("no home folder: HOME is unset or empty and the user database names none for this user, so goose-triggers cannot read goose's settings where goose reads them. Set HOME");
     }
     let _lock = lock(&cfg.state_dir)?;
     crate::util::create_private_dir(&cfg.runs_dir())?;
