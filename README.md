@@ -44,13 +44,13 @@ export PATH="$HOME/.local/bin:$PATH" &&
 goose-triggers --version
 ```
 
-After an upgrade, stop `goose-triggers run` and start it again: at start it writes the new release's plugin into each rule's working folder, while a `run` started before the upgrade goes on writing its own. A folder that is no longer any rule's working folder keeps the plugin that was written there last: delete its `.agents/plugins/goose-triggers` (the plugin of 0.0.5 and earlier can block tool calls in your own goose sessions in that folder).
-
 Or from source, with Rust 1.85 or newer (it installs to `~/.cargo/bin`):
 
 ```sh
 cargo install --locked --git https://github.com/alepacheco/goose-triggers --tag v0.0.6
 ```
+
+After an upgrade, either way, stop `goose-triggers run` and start it again: at start it writes the new release's plugin into each rule's working folder, while a `run` started before the upgrade goes on writing its own. A folder that is no longer any rule's working folder keeps the plugin that was written there last: delete its `.agents/plugins/goose-triggers` (the plugin of 0.0.5 and earlier can block tool calls in your own goose sessions in that folder).
 
 ## Check it works: selftest
 
