@@ -195,7 +195,7 @@ impl Harness {
             .context("starting goose-triggers run")?;
         self.daemon = Some(child);
         let listen = self.listen.clone();
-        wait_for("the webhook listener", Duration::from_secs(20), || {
+        wait_for("the webhook listener", WAIT, || {
             if let Some(d) = self.daemon.as_mut() {
                 if let Some(st) = d.try_wait()? {
                     bail!(
@@ -924,7 +924,12 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
         Ok(v) => v,
         Err(_) if interrupted() => finish_interrupted(&dir, keep),
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&dir);
+            // Nothing ran: the folder holds only goose's own files.
+            if keep {
+                println!("its files: {}", dir.display());
+            } else {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
             return Err(e);
         }
     };

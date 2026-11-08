@@ -49,33 +49,7 @@ pub fn status(cfg: &Config, all: bool) -> Result<()> {
         "RUN", "RULE", "STATE", "UPDATED", "SESSION"
     );
     for r in &runs {
-        let detail = match r.state.as_str() {
-            state::HELD => match store.pending_call(r.id)? {
-                Some(c) => format!("waits on: {} {}", c.tool_name, call_line(&c.tool_input, 80)),
-                None => "held".into(),
-            },
-            // `log <run>` is named once, below the table.
-            state::FAILED => r
-                .error
-                .as_deref()
-                .map(|e| e.trim_end_matches(&format!("; see goose-triggers log {}", r.id)))
-                .map(|e| short(e, 100))
-                .unwrap_or_default(),
-            state::APPROVED => format!(
-                "approved: resumes when `goose-triggers run` picks it up (`reject {}` withdraws it)",
-                r.id
-            ),
-            state::REJECTED => match store
-                .calls(r.id)?
-                .into_iter()
-                .rev()
-                .find(|c| c.state == "rejected")
-            {
-                Some(c) => format!("rejected: {} {}", c.tool_name, call_line(&c.tool_input, 80)),
-                None => "rejected".into(),
-            },
-            _ => String::new(),
-        };
+        let detail = detail(&store, r)?;
         println!(
             "{:>5}  {:<20} {:<9} {:<19}  {:<14} {}",
             r.id,
@@ -173,6 +147,37 @@ fn describe(v: &Value) -> Vec<String> {
         _ => {}
     }
     out
+}
+
+/// What `status` says of a run in its DETAIL column.
+fn detail(store: &Store, r: &crate::store::Run) -> Result<String> {
+    Ok(match r.state.as_str() {
+        state::HELD => match store.pending_call(r.id)? {
+            Some(c) => format!("waits on: {} {}", c.tool_name, call_line(&c.tool_input, 80)),
+            None => "held".into(),
+        },
+        // `log <run>` is named once, below the table.
+        state::FAILED => r
+            .error
+            .as_deref()
+            .map(|e| e.trim_end_matches(&format!("; see goose-triggers log {}", r.id)))
+            .map(|e| short(e, 100))
+            .unwrap_or_default(),
+        state::APPROVED => format!(
+            "approved: resumes when `goose-triggers run` picks it up (`reject {}` withdraws it)",
+            r.id
+        ),
+        state::REJECTED => match store
+            .calls(r.id)?
+            .into_iter()
+            .rev()
+            .find(|c| c.state == "rejected")
+        {
+            Some(c) => format!("rejected: {} {}", c.tool_name, call_line(&c.tool_input, 80)),
+            None => "rejected".into(),
+        },
+        _ => String::new(),
+    })
 }
 
 pub fn log(cfg: &Config, run: Option<i64>) -> Result<()> {
@@ -342,6 +347,23 @@ pub fn reject(cfg: &Config, run: i64) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn status_shows_the_call_a_rejected_run_was_held_at() {
+        let (s, _) = crate::store::tests::temp_store("status-rejected");
+        let run = crate::store::tests::running_run(&s, &["shell"]);
+        s.pre_tool_use(run, "shell", r#"{"command":"rm -rf x"}"#, None)
+            .unwrap();
+        let held = s.run(run).unwrap().unwrap();
+        assert!(detail(&s, &held).unwrap().starts_with("waits on: shell"));
+        s.reject(run).unwrap();
+        let r = s.run(run).unwrap().unwrap();
+        let d = detail(&s, &r).unwrap();
+        assert!(
+            d.starts_with("rejected: shell") && d.contains("rm -rf x"),
+            "{d}"
+        );
+    }
 
     #[test]
     fn a_delegate_call_is_never_approved() {

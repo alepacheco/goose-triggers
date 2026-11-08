@@ -185,10 +185,11 @@ fn check_rule(rule: &Rule, exe: &Path, goose: &str, hide_env: Option<&str>) -> R
     let info = crate::recipe::read(&rule.recipe).with_context(|| format!("rule {}", rule.name))?;
     crate::recipe::check_readable(goose, &rule.recipe, &info, &rule.working_dir, hide_env)
         .with_context(|| format!("rule {}", rule.name))?;
-    if rule.provider.is_none()
-        && info.provider.is_none()
-        && runner::goose_default_provider().is_none()
-    {
+    if no_provider(
+        rule.provider.as_deref(),
+        info.provider.as_deref(),
+        runner::goose_default_provider,
+    ) {
         // Not a refusal: goose may find a provider where goose-triggers does not look.
         say(&format!(
             "warning: rule {}: neither the rule (provider:) nor its recipe names a provider, and goose has none set (goose configure): goose will fail each of its runs until one is",
@@ -227,6 +228,16 @@ fn check_rule(rule: &Rule, exe: &Path, goose: &str, hide_env: Option<&str>) -> R
         }
     }
     Ok(())
+}
+
+/// Whether goose has no provider for a rule's runs: none on the rule, none in its recipe, and no
+/// default (`default`, read only when needed).
+fn no_provider(
+    rule: Option<&str>,
+    recipe: Option<&str>,
+    default: impl FnOnce() -> Option<String>,
+) -> bool {
+    rule.is_none() && recipe.is_none() && default().is_none()
 }
 
 type Active = Vec<(i64, JoinHandle<()>)>;
@@ -415,6 +426,16 @@ pub fn run(cfg: Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_rule_has_no_provider_only_when_none_names_one() {
+        let none = || None;
+        let default = || Some("openai".to_string());
+        assert!(super::no_provider(None, None, none));
+        assert!(!super::no_provider(Some("ollama"), None, none));
+        assert!(!super::no_provider(None, Some("anthropic"), none));
+        assert!(!super::no_provider(None, None, default));
+    }
+
     use super::*;
 
     #[test]

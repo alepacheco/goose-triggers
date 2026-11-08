@@ -128,22 +128,58 @@ fn settings_files(working_dir: &Path) -> Vec<PathBuf> {
     ]
 }
 
-/// Whether goose's config (`config_layers`, the files' texts in goose's merge order) turns off
-/// the plugin at `root`: its `plugins:` entry for that path has `enabled: false`. The last file
-/// that has `plugins:` gives the whole map, as goose merges top-level keys.
-fn disabled_in_config(config_layers: &[String], root: &Path) -> bool {
-    let key = serde_yaml_ng::Value::String(root.to_string_lossy().into_owned());
-    config_layers
+/// goose's `plugins` setting as goose 1.57.0 reads it (`get_param`): the `PLUGINS` variable
+/// (`env`) when it is set, read as JSON first; else the last of goose's config files
+/// (`config_layers`, their texts in goose's merge order) that has `plugins:`, which gives the
+/// whole map, a text value there read as JSON. None when no source has it.
+fn plugins_setting(env: Option<&str>, config_layers: &[String]) -> Option<Value> {
+    if let Some(v) = env {
+        return Some(env_value(v));
+    }
+    let v = config_layers
         .iter()
         .rev()
         .filter_map(|t| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(t).ok())
-        .find_map(|v| v.get("plugins").cloned())
-        .and_then(|p| {
-            p.get(&key)
-                .and_then(|e| e.get("enabled"))
-                .and_then(|e| e.as_bool())
-        })
-        == Some(false)
+        .find_map(|v| v.get("plugins").cloned())?;
+    match v.as_str() {
+        Some(text) => Some(env_value(text)),
+        None => serde_json::to_value(&v).ok(),
+    }
+}
+
+/// A setting's text as goose reads it (`parse_env_value`): JSON, else `true` or `false`, a
+/// number, or the text.
+fn env_value(v: &str) -> Value {
+    if let Ok(j) = serde_json::from_str(v) {
+        return j;
+    }
+    let t = v.trim();
+    match t.to_lowercase().as_str() {
+        "true" => return Value::Bool(true),
+        "false" => return Value::Bool(false),
+        _ => {}
+    }
+    if let Ok(i) = t.parse::<i64>() {
+        return Value::from(i);
+    }
+    if let Some(n) = t.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+        return Value::Number(n);
+    }
+    Value::String(v.to_string())
+}
+
+/// Whether goose's `plugins` setting turns off the plugin at `root`: goose reads it as a map of
+/// plugin folders to `{enabled: <bool>}` (a setting it cannot read so is an empty map, which
+/// turns nothing off), and drops a plugin whose entry has `enabled: false`.
+fn disabled_in_config(setting: Option<Value>, root: &Path) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        enabled: bool,
+    }
+    setting
+        .and_then(|v| serde_json::from_value::<std::collections::HashMap<String, Entry>>(v).ok())
+        .and_then(|m| m.get(root.to_string_lossy().as_ref()).map(|e| !e.enabled))
+        .unwrap_or(false)
 }
 
 /// The settings file that turns goose-triggers' plugin off, as goose decides it: the first
@@ -168,17 +204,26 @@ fn disabled_by(files: &[PathBuf]) -> Option<PathBuf> {
 
 /// Refuses a working folder where goose's settings turn goose-triggers' plugin off, as goose
 /// 1.57.0 reads them: its hooks would not run, so nothing would be held. goose reads two kinds:
-/// a `plugins:` entry in its config (`~/.config/goose/config.yaml`), keyed by the plugin's
-/// folder, with `enabled: false`; and `disabledPlugins` (and `enabledPlugins`) lists in its
-/// plugin settings files.
+/// its `plugins` setting (the `PLUGINS` variable, else `plugins:` in its config files), keyed
+/// by the plugin's folder, with `enabled: false`; and `disabledPlugins` (and `enabledPlugins`)
+/// lists in its plugin settings files.
 pub fn preflight(working_dir: &Path) -> Result<()> {
     // goose keys its config by the folder it runs in, as the system names it.
     let wd = std::fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
     let root = plugin_root(&wd);
-    if disabled_in_config(&crate::runner::goose_config_layers(), &root) {
+    let env = std::env::var("PLUGINS").ok();
+    let setting = plugins_setting(env.as_deref(), &crate::runner::goose_config_layers());
+    if disabled_in_config(setting, &root) {
         bail!(
-            "goose's config ({}, or a file goose merges with it) turns off the plugin at {}: set its `enabled` under `plugins:` to true, or nothing could be held",
-            goose_config_dir().join("config.yaml").display(),
+            "goose's plugins setting ({}) turns off the plugin at {}: set its `enabled` to true, or nothing could be held",
+            if env.is_some() {
+                "the PLUGINS variable".to_string()
+            } else {
+                format!(
+                    "`plugins:` in {}, or a file goose merges with it",
+                    goose_config_dir().join("config.yaml").display()
+                )
+            },
             root.display()
         );
     }
@@ -274,20 +319,39 @@ mod tests {
     }
 
     #[test]
-    fn the_last_config_file_with_plugins_decides() {
+    fn the_plugins_setting_is_read_as_goose_reads_it() {
         let root = Path::new("/w/.agents/plugins/goose-triggers");
+        let off_of = |layers: &[String]| disabled_in_config(plugins_setting(None, layers), root);
         let off =
             "plugins:\n  /w/.agents/plugins/goose-triggers:\n    enabled: false\n".to_string();
         let on = "plugins:\n  /w/.agents/plugins/goose-triggers:\n    enabled: true\n".to_string();
         let other =
             "plugins:\n  /x/.agents/plugins/goose-triggers:\n    enabled: false\n".to_string();
-        assert!(disabled_in_config(std::slice::from_ref(&off), root));
-        assert!(!disabled_in_config(&[off.clone(), on], root));
-        assert!(!disabled_in_config(&[off.clone(), other], root));
+        // The last file with `plugins:` gives the whole map.
+        assert!(off_of(std::slice::from_ref(&off)));
+        assert!(!off_of(&[off.clone(), on.clone()]));
+        assert!(!off_of(&[off.clone(), other]));
+        assert!(off_of(&[off.clone(), "GOOSE_PROVIDER: openai\n".into()]));
+        assert!(!off_of(&[]));
+        // A text value is read as JSON.
+        let quoted = r#"plugins: '{"/w/.agents/plugins/goose-triggers": {"enabled": false}}'"#;
+        assert!(off_of(&[quoted.to_string()]));
+        // A map goose cannot read whole is an empty one for goose.
+        let odd = "plugins:\n  /w/.agents/plugins/goose-triggers:\n    enabled: false\n  /y:\n    on: 1\n";
+        assert!(!off_of(&[odd.to_string()]));
+        // The PLUGINS variable, when set, is the setting, whatever the files say.
+        let env = r#"{"/w/.agents/plugins/goose-triggers": {"enabled": false}}"#;
         assert!(disabled_in_config(
-            &[off, "GOOSE_PROVIDER: openai\n".into()],
+            plugins_setting(Some(env), std::slice::from_ref(&on)),
             root
         ));
-        assert!(!disabled_in_config(&[], root));
+        assert!(!disabled_in_config(
+            plugins_setting(Some("{}"), std::slice::from_ref(&off)),
+            root
+        ));
+        assert!(!disabled_in_config(
+            plugins_setting(Some("x"), &[off]),
+            root
+        ));
     }
 }

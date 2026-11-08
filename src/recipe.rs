@@ -162,11 +162,12 @@ pub fn check_values_stay_text(
     Ok(real)
 }
 
-/// At `goose-triggers run`'s start: goose reads the recipe as a recipe (a title, a
-/// description, a prompt or instructions, as goose itself requires), rendered with a
-/// placeholder for each parameter an event can fill, so a file that is no recipe is refused at
-/// start rather than at each event. A recipe with a required file parameter is left to each
-/// event, which is refused for it.
+/// At `goose-triggers run`'s start: the recipe declares no file parameter (goose-triggers never
+/// fills one, and goose 1.57.0 accepts a file parameter only as required, so no event could run
+/// it), and goose reads it as a recipe (a title, a description, a prompt or instructions, as
+/// goose itself requires), rendered with a placeholder for each parameter every event must
+/// fill and the defaults for the rest, as an event that gives only those would render it. So a
+/// file that is no recipe is refused at start rather than at each event.
 pub fn check_readable(
     goose: &str,
     recipe: &Path,
@@ -174,18 +175,27 @@ pub fn check_readable(
     wd: &Path,
     hide_env: Option<&str>,
 ) -> Result<()> {
-    if info.params.iter().any(|p| p.file && p.needed) {
-        return Ok(());
+    if let Some(p) = info.params.iter().find(|p| p.file) {
+        bail!(
+            "the recipe {}'s parameter {} is a file parameter: goose would paste the contents of the file it names into the recipe itself, so goose-triggers does not fill file parameters from events, and no event could run it. Declare it as a string and have the recipe read the file with its tools",
+            recipe.display(),
+            p.key
+        );
     }
-    let placeholders: Vec<(String, String)> = info
-        .params
-        .iter()
-        .filter(|p| !p.file)
-        .map(|p| (p.key.clone(), "goosetriggersplaceholder".to_string()))
-        .collect();
+    let placeholders = start_placeholders(info);
     render(goose, recipe, &placeholders, wd, hide_env)
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("goose cannot read the recipe {} ({e:#})", recipe.display()))
+}
+
+/// The values the start check renders a recipe with: a placeholder for each parameter every
+/// event must give (required, no default); the others keep their defaults.
+fn start_placeholders(info: &RecipeInfo) -> Vec<(String, String)> {
+    info.params
+        .iter()
+        .filter(|p| p.needed)
+        .map(|p| (p.key.clone(), "goosetriggersplaceholder".to_string()))
+        .collect()
 }
 
 /// goose's own output when it could not render a recipe, which may quote the values it was
@@ -438,6 +448,26 @@ prompt: "{{ file_path }} {{ note }} {{ who }}"
         fields.insert("doc".to_string(), "/home/me/.ssh/id_rsa".to_string());
         let err = params_for(&info, &fields).unwrap_err().to_string();
         assert!(err.contains("file parameter"), "{err}");
+    }
+
+    #[test]
+    fn the_start_check_fills_only_what_every_event_must_give() {
+        let info = parse(
+            "title: t\ndescription: d\nprompt: '{{ a }} {{ b }}'\nparameters:\n  - {key: a, input_type: string, requirement: required}\n  - {key: b, input_type: string, requirement: optional, default: x}\n  - {key: c, input_type: string, requirement: required, default: y}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            start_placeholders(&info),
+            [("a".to_string(), "goosetriggersplaceholder".to_string())]
+        );
+        let file = parse(
+            "title: t\ndescription: d\nprompt: p\nparameters:\n  - {key: doc, input_type: file, requirement: required}\n",
+        )
+        .unwrap();
+        let err = check_readable("goose", Path::new("r.yaml"), &file, Path::new("/"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parameter doc is a file parameter"), "{err}");
     }
 
     #[test]

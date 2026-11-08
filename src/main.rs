@@ -29,7 +29,7 @@ use clap::{CommandFactory, Parser, Subcommand};
     about = "Event-driven background runs for goose, with approval holds"
 )]
 struct Cli {
-    /// Config file [default: $GOOSE_TRIGGERS_CONFIG, else ~/.config/goose-triggers/config.yaml]
+    /// Config file [default: $GOOSE_TRIGGERS_CONFIG, else ~/.config/goose-triggers/config.yaml]; not for selftest or hostile-suite, which make their own
     #[arg(short, long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
 
@@ -117,10 +117,7 @@ enum Cmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let (Some(_), Cmd::Selftest { .. } | Cmd::HostileSuite { .. }) = (&cli.config, &cli.command)
-    {
-        // Both make a config of their own in a temporary folder: a config named here would do
-        // nothing, which reads as if it did.
+    if config_not_for_command(&cli) {
         Cli::command()
             .error(
                 clap::error::ErrorKind::ArgumentConflict,
@@ -181,6 +178,12 @@ fn main() -> ExitCode {
     }
 }
 
+/// `-c` given to `selftest` or `hostile-suite`: both make a config of their own in a temporary
+/// folder, so a config named for them would do nothing, which reads as if it did.
+fn config_not_for_command(cli: &Cli) -> bool {
+    cli.config.is_some() && matches!(cli.command, Cmd::Selftest { .. } | Cmd::HostileSuite { .. })
+}
+
 /// The environment variable naming the config file.
 pub const CONFIG_ENV: &str = "GOOSE_TRIGGERS_CONFIG";
 
@@ -190,4 +193,61 @@ pub fn default_config_path() -> PathBuf {
     util::config_home()
         .join("goose-triggers")
         .join("config.yaml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("goose-triggers").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn values_out_of_range_are_command_line_errors() {
+        let real = ["hostile-suite", "--provider", "ollama", "--model", "m"];
+        for bad in [
+            vec!["hostile-suite", "--holds", ""],
+            vec!["hostile-suite", "--holds", " , "],
+            vec!["hostile-suite", "--holds", "shell,["],
+            [&real[..], &["--approvals", "11"]].concat(),
+            [&real[..], &["--run-minutes", "0"]].concat(),
+            [&real[..], &["--run-minutes", "1441"]].concat(),
+            vec!["hostile-suite", "--approvals", "2"],
+        ] {
+            let e = parse(&bad)
+                .err()
+                .unwrap_or_else(|| panic!("{bad:?} parsed"));
+            assert_eq!(e.exit_code(), 2, "{bad:?}");
+        }
+        assert!(
+            parse(&[&real[..], &["--approvals", "10", "--run-minutes", "1440"]].concat()).is_ok()
+        );
+        let Cmd::HostileSuite { holds: Some(h), .. } =
+            parse(&["hostile-suite", "--holds", "shell write,edit"])
+                .unwrap()
+                .command
+        else {
+            panic!("no holds");
+        };
+        assert_eq!(format!("{h:?}"), r#"Holds(["shell", "write", "edit"])"#);
+    }
+
+    #[test]
+    fn a_config_is_refused_only_for_commands_that_make_their_own() {
+        for (args, refused) in [
+            (vec!["-c", "x.yaml", "selftest"], true),
+            (vec!["selftest", "--config", "x.yaml"], true),
+            (vec!["-c", "x.yaml", "hostile-suite"], true),
+            (vec!["selftest"], false),
+            (vec!["-c", "x.yaml", "status"], false),
+            (vec!["-c", "x.yaml", "run"], false),
+        ] {
+            assert_eq!(
+                config_not_for_command(&parse(&args).unwrap()),
+                refused,
+                "{args:?}"
+            );
+        }
+    }
 }

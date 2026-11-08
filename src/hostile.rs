@@ -1966,14 +1966,14 @@ fn brief(root: &Path, tool: &str, input: &str) -> String {
     crate::util::short(&shown(root, &text), 100)
 }
 
-fn end_of(o: &Outcome) -> String {
+fn end_of(root: &Path, o: &Outcome) -> String {
     if o.timed_out {
         return "run timed out (stopped by the suite)".into();
     }
     match o.state.as_str() {
         state::FAILED => format!(
             "run failed: {}",
-            crate::util::short(o.error.as_deref().unwrap_or(""), 120)
+            crate::util::short(&shown(root, o.error.as_deref().unwrap_or("")), 120)
         ),
         other => format!("run {other}"),
     }
@@ -2004,7 +2004,7 @@ fn approvals_text(o: &Outcome) -> Option<String> {
 }
 
 fn cell(root: &Path, case: &Case, o: &Outcome, real: bool) -> String {
-    let end = end_of(o);
+    let end = end_of(root, o);
     if let Canary::Recipe(..) = case.canary {
         let how = if o.error.as_deref().is_some_and(|e| e.contains("breaks it")) {
             "the value breaks the recipe"
@@ -2173,7 +2173,7 @@ struct Counts {
     unread: Vec<String>,
 }
 
-fn count(cases: &[Case], outcomes: &[Outcome]) -> Counts {
+fn count(root: &Path, cases: &[Case], outcomes: &[Outcome]) -> Counts {
     let mut c = Counts::default();
     for (case, o) in cases.iter().zip(outcomes) {
         if matches!(case.canary, Canary::Recipe(..)) {
@@ -2194,8 +2194,11 @@ fn count(cases: &[Case], outcomes: &[Outcome]) -> Counts {
         });
         c.held_first += usize::from(held_first && !o.tripped);
         if let Some(e) = &o.export_error {
-            c.unread
-                .push(format!("{} ({})", case.id, crate::util::short(e, 160)));
+            c.unread.push(format!(
+                "{} ({})",
+                case.id,
+                crate::util::short(&shown(root, e), 160)
+            ));
         }
         if o.timed_out {
             c.timed_out.push(case.id.to_string());
@@ -2203,7 +2206,7 @@ fn count(cases: &[Case], outcomes: &[Outcome]) -> Counts {
             c.failed.push(format!(
                 "{} ({})",
                 case.id,
-                crate::util::short(o.error.as_deref().unwrap_or(""), 160)
+                crate::util::short(&shown(root, o.error.as_deref().unwrap_or("")), 160)
             ));
         }
     }
@@ -2234,14 +2237,15 @@ fn preflight(set: &Setup, dir: &Path) -> Result<String> {
         None,
         "pass --goose <path>",
     )?;
-    provider_answers(set, dir)?;
+    provider_answers(set, dir, &[])?;
     Ok(version)
 }
 
 /// With a real model: one short goose run with no extensions, before the first pass, so that a
 /// provider that is not there, a key it refuses or a model it does not have stops the suite
-/// at once (after goose's own retries) rather than every run in turn.
-fn provider_answers(set: &Setup, dir: &Path) -> Result<()> {
+/// at once (after goose's own retries) rather than every run in turn. `env` is set for goose
+/// besides the suite's own settings (the tests point the provider at a scripted server).
+fn provider_answers(set: &Setup, dir: &Path, env: &[(&str, String)]) -> Result<()> {
     let Model::Real { provider, model } = set.model else {
         return Ok(());
     };
@@ -2266,6 +2270,7 @@ fn provider_answers(set: &Setup, dir: &Path) -> Result<()> {
     .env("GOOSE_DISABLE_KEYRING", "1")
     .env("GOOSE_PROVIDER", provider)
     .env("GOOSE_MODEL", model)
+    .envs(env.iter().map(|(k, v)| (k, v)))
     .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
@@ -2297,15 +2302,15 @@ fn provider_answers(set: &Setup, dir: &Path) -> Result<()> {
             Ok(())
         }
         Some(o) => {
-            let said = if o.stderr.iter().any(|b| !b.is_ascii_whitespace()) {
-                o.stderr
-            } else {
-                o.stdout
-            };
-            let said = String::from_utf8_lossy(&said)
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
+            // goose says why on either stream, as its version and the failure have it.
+            let said = format!(
+                "{} {}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
             bail!(
                 "goose got no answer from {model} through its {provider} provider ({}), so the suite sent nothing; goose said: {}",
                 o.status,
@@ -2407,14 +2412,19 @@ fn suite(
         if !real {
             // The scripted model: every injected call carried out with no holds, and held at
             // its first injected call with them.
-            let held_first = count(std::slice::from_ref(case), std::slice::from_ref(b)).held_first;
+            let held_first = count(
+                &on_root,
+                std::slice::from_ref(case),
+                std::slice::from_ref(b),
+            )
+            .held_first;
             ok &= a.all_tripped && !b.tripped && held_first == 1;
         }
     }
     if crate::selftest::interrupted() {
         bail!("interrupted");
     }
-    let (c_off, c_on) = (count(&cases, &off), count(&cases, &on));
+    let (c_off, c_on) = (count(&off_root, &cases, &off), count(&on_root, &cases, &on));
     let recipe_line = format!("The recipe-structure check refused {changes_refused} of {changes} values that would change the recipe and {breaks_refused} of {breaks} that would break it, in both passes.");
     // Tools goose offered the runs that the holds leave open and that do more than read: the
     // scripted model server records them; with a real model, goose's output names them.
@@ -2512,7 +2522,7 @@ fn suite(
     summary.push_str(&format!(
         "\ngoose offered the runs these tools: {}. Not held by `hold: {hold_text}`: {}.",
         if offered.is_empty() {
-            "none seen (no run got as far as the model)".to_string()
+            "none seen in the runs' output".to_string()
         } else {
             offered.join(", ")
         },
@@ -2573,7 +2583,7 @@ fn suite(
                 case.id,
                 md(&approved),
                 if written { "yes" } else { "no" },
-                md(&end_of(o))
+                md(&end_of(&root, o))
             ));
         }
         let (given, used, lapsed, open) = approval_counts(&outs);
@@ -2756,6 +2766,63 @@ mod tests {
         );
         assert_eq!(advertised_tools(jsonl), ["shell", "tree", "read_image"]);
         assert!(advertised_tools("").is_empty());
+    }
+
+    /// The goose binary to test with (`GOOSE_BIN`, else `goose` on PATH), if one runs.
+    fn test_goose() -> Option<String> {
+        let goose = std::env::var("GOOSE_BIN").unwrap_or_else(|_| "goose".into());
+        let root = std::env::temp_dir().join(format!("gt-goose-probe-{}", std::process::id()));
+        let found = std::process::Command::new(&goose)
+            .arg("--version")
+            .env("GOOSE_PATH_ROOT", &root)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let _ = std::fs::remove_dir_all(&root);
+        found.then_some(goose)
+    }
+
+    #[test]
+    fn the_provider_must_answer_before_the_first_pass() {
+        let Some(goose) = test_goose() else {
+            eprintln!("skipped: no goose binary (put goose on PATH or set GOOSE_BIN)");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "gt-provider-check-{}-{}",
+            std::process::id(),
+            crate::util::now()
+        ));
+        crate::util::create_private_dir(&dir).unwrap();
+        let check = |provider: &str, env: &[(&str, String)]| {
+            let model = Model::Real {
+                provider: provider.into(),
+                model: "goose-triggers-selftest".into(),
+            };
+            let set = Setup {
+                goose: &goose,
+                model: &model,
+                run_limit: Duration::from_secs(120),
+            };
+            provider_answers(&set, &dir, env)
+        };
+        // A provider that answers: the scripted model server, as goose's openai provider.
+        let server = scripted_model::start(Duration::from_secs(30), Script::Selftest).unwrap();
+        let env = [
+            ("OPENAI_BASE_URL", format!("http://{}/v1", server.addr)),
+            ("OPENAI_API_KEY", "the-test-needs-no-key".to_string()),
+            ("GOOSE_DISABLE_KEYRING", "1".to_string()),
+        ];
+        check("openai", &env).unwrap();
+        // One goose does not have: refused, in goose's words.
+        let err = check("goose-triggers-selftest-missing", &env)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("so the suite sent nothing")
+                && err.contains("goose-triggers-selftest-missing"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
