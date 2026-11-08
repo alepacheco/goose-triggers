@@ -1,0 +1,22 @@
+# goose-triggers 0.0.6: automated code review, round 3 of 3
+
+Verdict: FIT
+
+This review covers `git diff f764928..a020106` (commit a020106, the fixes for round 2's findings), read line by line, with the code and text around it. It checks both findings of `reviews/0.0.6/code-review-2.md` against their fixes. Read: `reviews/0.0.6/code-review-2.md`; README.md's Install section and the selftest and hostile-event paragraphs that speak of `--goose` and `--keep`; `tests/keep.rs` whole; `tests/readme.rs`; in `src/selftest.rs`, `resolve_goose`, `run` up to the start check, `catch_interrupt` and `finish_interrupted`; `run` and `preflight` in `src/hostile.rs`; in `src/util.rs`, `goose_version`, `output_within`, `output_unless` and `create_private_dir`; `main` in `src/main.rs`; `run` in `src/selftest.rs` and `src/hostile.rs` at v0.0.5; the step of `.github/workflows/release-install.yml` that reads the Install block, and the test and lint steps of `.github/workflows/ci.yml`. Each case below was traced by hand. Nothing was built, tested or run.
+
+## Findings
+
+None.
+
+## Checked and fine
+
+- **Round 2's finding 1 (`tests/keep.rs` needed a system program).** Fixed, and correctly. tests/keep.rs:22-31 writes a file holding `not a program` and passes its path as `--goose`. The test no longer depends on any program of the system (round 2's `false`), nor on a shell.
+  - The file exists, so `resolve_goose` resolves it and the command makes its folder. `goose_version` then cannot start it. `std::fs::write` makes the file with mode 0666 less the umask, so it never has an execute bit. Linux refuses to execute a file with no execute bit to every user, root included: root's override of file permissions needs at least one execute bit to execute. So the start fails with "Permission denied" as root and as a normal user. Even on a file system that shows every file as executable, the start fails, or the file is read as a shell script that fails; either way `goose_version` returns an error.
+  - That error takes the same path in `selftest` (src/selftest.rs:1015-1025) and in `hostile-suite` (src/hostile.rs:2132-2143) as round 2's exit status 1 did. With `--keep`, the folder is kept and named after `its files, kept with --keep:`; without it, it is removed.
+  - The test still tells 0.0.6 from a regression. A folder left without `--keep` fails `left.is_empty()`. A folder not kept with `--keep` fails `left.len() == 1`. A kept folder not named, or named as 0.0.5 names it (`its files: <folder>`, printed before the error), fails the `contains` check. The name matches: the command's folder is its `TMPDIR` joined with its name, and `read_dir` gives the same path.
+  - The file sits beside the test's folder, not in it (`with_extension` adds `.goose` to a name with no dot), so it is not counted in `left`. The test removes the file (line 43) and the folder (line 42) before it asserts, so a failed assertion leaves nothing behind either. Only a panic before that (the binary cannot be started at all) would leave them, as before.
+  - The new lines are as `cargo fmt` writes them, and clippy's borrow lints do not fire: `fake` is used again after each borrow. Line 1 is 100 characters, within the limit.
+- **Round 2's finding 2 (the upgrade paragraph).** Fixed. README.md:47 "Or from source, ..." now follows the release's Install block directly. The upgrade paragraph (README.md:53) follows the `cargo install` block, and "either way" says it holds for both. It reads right there, before "## Check it works: selftest". Its text is otherwise unchanged and still matches the code, as round 2 found. No other text in the repository refers to where the paragraph was.
+- **The Install block readers.** `tests/readme.rs` takes the first `sh` block after "## Install": still the release's block, ending at `goose-triggers --version`. The moved paragraph has no code block. The `cargo install` line still ends with a line break, as the test asks. The release-install workflow reads the block the same way, so it is unaffected too.
+- **README on `--goose`.** README.md:77 and 89 still describe what the test checks: a path that does not exist is refused before any folder is made; one that exists but where goose does not run makes a folder, kept only with `--keep`.
+- **The reviews index.** `reviews/README.md` has no 0.0.6 row yet. For 0.0.5, the row came with the last round's commit, so it is not missing at this point.

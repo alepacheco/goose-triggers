@@ -1,4 +1,4 @@
-# goose-triggers 0.0.6: automated code review, round 1
+# goose-triggers 0.0.6: automated code review, round 1 of 3
 
 Verdict: FIT
 
