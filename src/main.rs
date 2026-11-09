@@ -86,10 +86,10 @@ enum Cmd {
         #[arg(long)]
         keep: bool,
         /// Send the events to a real model through this goose provider (ollama, openai, anthropic, ...), set up through the environment as goose reads it (OLLAMA_HOST, OPENAI_API_KEY, ...); needs --model
-        #[arg(long, value_name = "NAME", requires = "model", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        #[arg(long, value_name = "NAME", requires = "model", value_parser = non_blank_name)]
         provider: Option<String>,
         /// The real model, as the provider names it (qwen3:8b, ...); needs --provider
-        #[arg(long, value_name = "NAME", requires = "provider", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        #[arg(long, value_name = "NAME", requires = "provider", value_parser = non_blank_name)]
         model: Option<String>,
         /// With a real model: also send this many plain entries (0 to 10) and approve the calls they are held at (at most 6 a run, the later ones rejected), to see what the model does after an approval
         #[arg(
@@ -113,6 +113,14 @@ enum Cmd {
     /// Called by goose through goose-triggers' plugin hooks; not for direct use
     #[command(hide = true)]
     Hook,
+}
+
+fn non_blank_name(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        Err("must contain a non-whitespace character".into())
+    } else {
+        Ok(value.into())
+    }
 }
 
 fn main() -> ExitCode {
@@ -218,6 +226,16 @@ mod tests {
             vec!["hostile-suite", "--approvals", "2"],
             vec!["hostile-suite", "--provider", "", "--model", "m"],
             vec!["hostile-suite", "--provider", "ollama", "--model", ""],
+            vec!["hostile-suite", "--provider", " ", "--model", "m"],
+            vec!["hostile-suite", "--provider", "ollama", "--model", " "],
+            vec!["hostile-suite", "--provider", "\t\n", "--model", "m"],
+            vec![
+                "hostile-suite",
+                "--provider",
+                "ollama",
+                "--model",
+                "\u{2003}",
+            ],
         ] {
             let e = parse(&bad)
                 .err()

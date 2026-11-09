@@ -1,5 +1,5 @@
 //! A selftest or hostile suite that cannot start (here its goose cannot be run) removes its folder,
-//! or with `--keep` keeps it and names it after the reason.
+//! or with `--keep` keeps it and prints its path after the reason.
 
 use std::process::Command;
 
@@ -42,6 +42,11 @@ fn a_selftest_or_suite_that_cannot_start_keeps_its_folder_only_with_keep() {
             let _ = std::fs::remove_dir_all(&tmp);
             let _ = std::fs::remove_file(&fake);
             assert_eq!(out.status.code(), Some(1), "{cmd} keep={keep}: {said}");
+            assert!(
+                said.contains("the path given with --goose must be a working goose binary"),
+                "{said}"
+            );
+            assert!(!said.contains("pass --goose <path>"), "{said}");
             if keep {
                 assert_eq!(left.len(), 1, "{cmd} --keep: {left:?}");
                 let named = format!("its files, kept with --keep: {}", left[0].display());
@@ -52,4 +57,37 @@ fn a_selftest_or_suite_that_cannot_start_keeps_its_folder_only_with_keep() {
             }
         }
     }
+}
+
+#[test]
+fn goose_version_names_an_explicit_binary_that_exits_unsuccessfully() {
+    use std::os::unix::fs::PermissionsExt;
+    let fake = std::env::temp_dir().join(format!("gt-failed-goose-{}", std::process::id()));
+    std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for cmd in ["selftest", "hostile-suite"] {
+        if cmd == "hostile-suite"
+            && !Command::new("curl")
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        {
+            continue;
+        }
+        let out = Command::new(env!("CARGO_BIN_EXE_goose-triggers"))
+            .arg(cmd)
+            .arg("--goose")
+            .arg(&fake)
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{said}");
+        assert!(said.contains("--version` failed"), "{said}");
+        assert!(
+            said.contains("the path given with --goose must be a working goose binary"),
+            "{said}"
+        );
+        assert!(!said.contains("pass --goose <path>"), "{said}");
+    }
+    std::fs::remove_file(fake).unwrap();
 }

@@ -304,7 +304,7 @@ pub fn run(cfg: Config) -> Result<()> {
         &cfg.goose,
         &[],
         cfg.webhook.as_ref().and_then(|w| w.secret_env.as_deref()),
-        "set `goose:` in the config to the goose binary",
+        "install goose (https://goose-docs.ai/docs/getting-started/installation) or set `goose:` in the config to the goose binary",
     )?;
     for rule in &cfg.rules {
         check_rule(

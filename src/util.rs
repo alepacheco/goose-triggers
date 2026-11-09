@@ -316,9 +316,7 @@ pub fn goose_version(
     let out = match output_within(&mut cmd, std::time::Duration::from_secs(60)) {
         Ok(Some(out)) => out,
         Ok(None) => anyhow::bail!("`{goose} --version` took over 60 s"),
-        Err(e) => anyhow::bail!(
-            "running `{goose} --version`: {e}: install goose (https://goose-docs.ai/docs/getting-started/installation) or {hint}"
-        ),
+        Err(e) => anyhow::bail!("running `{goose} --version`: {e}: {hint}"),
     };
     if !out.status.success() {
         anyhow::bail!("`{goose} --version` failed ({}): {hint}", out.status);

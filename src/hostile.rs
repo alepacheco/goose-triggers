@@ -2087,6 +2087,7 @@ pub struct Options {
 }
 
 pub fn run(opts: Options) -> Result<()> {
+    let hint = crate::selftest::goose_hint(opts.goose.is_some());
     let goose = crate::selftest::resolve_goose(opts.goose)?;
     let holds = hold_list(opts.holds);
     if let Model::Real { provider, .. } = &opts.model {
@@ -2124,7 +2125,7 @@ pub fn run(opts: Options) -> Result<()> {
         model: &opts.model,
         run_limit: Duration::from_secs(opts.run_minutes * 60),
     };
-    let version = match preflight(&set, &dir) {
+    let version = match preflight(&set, &dir, hint) {
         Ok(v) => v,
         Err(_) if crate::selftest::interrupted() => {
             crate::selftest::finish_interrupted(&dir, opts.keep)
@@ -2233,12 +2234,12 @@ fn minutes(limit: Duration) -> String {
 
 /// Before the suite sends anything: goose runs (its version), and with a real model, the
 /// provider answers.
-fn preflight(set: &Setup, dir: &Path) -> Result<String> {
+fn preflight(set: &Setup, dir: &Path, hint: &str) -> Result<String> {
     let version = crate::util::goose_version(
         set.goose,
         &[("GOOSE_PATH_ROOT", dir.join("goose-root").as_path())],
         None,
-        "pass --goose <path>",
+        hint,
     )?;
     provider_answers(set, dir, &[])?;
     Ok(version)

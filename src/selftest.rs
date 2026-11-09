@@ -990,7 +990,17 @@ pub(crate) fn resolve_goose(goose: Option<PathBuf>) -> Result<String> {
     })
 }
 
+/// The repair for a failed version probe depends on whether a binary was selected explicitly.
+pub(crate) fn goose_hint(explicit: bool) -> &'static str {
+    if explicit {
+        "the path given with --goose must be a working goose binary"
+    } else {
+        "install goose (https://goose-docs.ai/docs/getting-started/installation) or pass --goose <path>"
+    }
+}
+
 pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
+    let hint = goose_hint(goose.is_some());
     let goose = resolve_goose(goose)?;
     let dir = std::env::temp_dir().join(format!(
         "goose-triggers-selftest-{}-{}",
@@ -1008,7 +1018,7 @@ pub fn run(goose: Option<PathBuf>, keep: bool) -> Result<()> {
         &goose,
         &[("GOOSE_PATH_ROOT", root.as_path())],
         None,
-        "pass --goose <path>",
+        hint,
     ) {
         Ok(v) => v,
         Err(_) if interrupted() => finish_interrupted(&dir, keep),
